@@ -4,6 +4,7 @@ import re
 import struct
 import zipfile
 import urllib.parse
+from collections import Counter
 from datetime import datetime
 from email.message import EmailMessage
 from email.policy import SMTP as SMTP_POLICY
@@ -17,6 +18,7 @@ from PIL import Image as PILImage
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import inch
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepInFrame
 )
@@ -205,6 +207,52 @@ DESIGNATION_OPTIONS = [
     "Principal",
     "Custom (User Defined)",
 ]
+
+
+# ------------------------------------------------------------------
+# COLLEGE AUTO-DETECTION: 5-digit course codes found in the "Course" column
+# ------------------------------------------------------------------
+COLLEGE_COURSE_CODES = {
+    "UPG": {
+        "53011", "53012", "53013", "53014", "53015", "53016",
+        "53021", "53022", "53023", "53024", "53026",
+    },
+    "NMC": {
+        "45611", "45612", "45613", "45614", "45615", "45616", "45617", "45618",
+        "45619", "45620", "45621", "45701", "45702", "45703",
+    },
+    "MBC": {
+        "40322", "40711", "40712", "40713", "40714", "40715", "40716", "40717",
+        "40718", "40719", "40720", "40721", "40722", "40723", "40724", "40725",
+        "40726", "40727", "40761", "40762", "40763", "40764", "40765", "40766",
+        "40767", "40768", "40769", "40771", "40772", "40774", "40775", "40777",
+        "40778", "40779",
+    },
+}
+COURSE_CODE_TO_COLLEGE = {
+    code: college for college, codes in COLLEGE_COURSE_CODES.items() for code in codes
+}
+_COURSE_CODE_RE = re.compile(r"(?<!\d)\d{5}(?!\d)")
+
+
+def detect_college(course_series):
+    """
+    Identifies the college from the 5-digit course codes present in the raw Course column.
+    Returns (college_key_or_None, hits_per_college, unknown_codes).
+    college_key is None when no code matched OR when codes of more than one college are mixed
+    (the caller tells the two situations apart using hits_per_college).
+    """
+    hits = {k: Counter() for k in COLLEGE_COURSE_CODES}
+    unknown = Counter()
+    for value in course_series.fillna("").astype(str):
+        for code in _COURSE_CODE_RE.findall(value):
+            college = COURSE_CODE_TO_COLLEGE.get(code)
+            if college:
+                hits[college][code] += 1
+            else:
+                unknown[code] += 1
+    matched = [k for k, c in hits.items() if c]
+    return (matched[0] if len(matched) == 1 else None), hits, unknown
 
 
 # ==========================================
@@ -593,6 +641,15 @@ def build_address_lines(name, details):
 # EXCEL LOADING ("EVALUATION DASHBOARD DETAILS" FORMAT)
 # ==========================================
 
+def _norm_header(s):
+    """'In Progress Count' / 'in-progress count' / 'InProgressCount' -> 'inprogresscount'."""
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+def _count_aliases(base):
+    return [base, f"{base} count", f"{base} answer books", f"no. of {base}", f"total {base}"]
+
+
 COLUMN_ALIASES = {
     "name": ["examiner name", "examinername"],
     "email": ["examiner email", "examineremail", "email"],
@@ -604,12 +661,47 @@ COLUMN_ALIASES = {
     "exam_date": ["exam date", "examdate"],
     "assigned": ["assigned date time", "assigned date", "assigned datetime"],
     "eval_last_date": ["evaluation last date", "evaluationlastdate", "eval last date"],
-    "checked": ["checked", "checked count", "no. of answer books"],
+    # Evaluation-progress counts (used to decide whether the Thanking Letter may be generated)
+    "unchecked": _count_aliases("unchecked"),
+    "rejected": _count_aliases("rejected"),
+    "in_progress": _count_aliases("in progress"),
+    "present": _count_aliases("present"),
+    "uploaded": _count_aliases("uploaded"),
+    "checked": _count_aliases("checked") + ["no. of answer books"],
 }
 REQUIRED_FIELDS = ["name", "role", "course", "semester", "subject"]
 
+COMPLETION_FIELDS = ["unchecked", "rejected", "in_progress", "present", "uploaded", "checked"]
+COMPLETION_LABELS = {
+    "unchecked": "Unchecked",
+    "rejected": "Rejected",
+    "in_progress": "In Progress",
+    "present": "Present",
+    "uploaded": "Uploaded",
+    "checked": "Checked",
+}
+
+
+def completion_status(rec):
+    """
+    A Moderator / Revaluator has completed the assignment only when
+    Unchecked = Rejected = In Progress = 0  AND  Present = Uploaded = Checked (and not all zero).
+    Returns (is_complete, human_readable_reason_if_not).
+    """
+    reasons = []
+    for key in ("unchecked", "rejected", "in_progress"):
+        if rec[key] != 0:
+            reasons.append(f"{COMPLETION_LABELS[key]}: {rec[key]}")
+    present, uploaded, checked = rec["present"], rec["uploaded"], rec["checked"]
+    if not (present == uploaded == checked):
+        reasons.append(f"Present ({present}) / Uploaded ({uploaded}) / Checked ({checked}) do not match")
+    elif present == 0:
+        reasons.append("no answer books recorded")
+    return (not reasons), "; ".join(reasons)
+
 
 def load_dashboard_excel(file_obj):
+    """Returns (dataframe, missing_required_fields, missing_completion_fields)."""
     raw = pd.read_excel(file_obj, header=None, dtype=str)
 
     header_idx = 0
@@ -624,17 +716,22 @@ def load_dashboard_excel(file_obj):
     df.columns = headers
     df = df.reset_index(drop=True)
 
-    lower_to_actual = {h.lower(): h for h in headers if h and h.lower() != "nan"}
+    norm_to_actual = {}
+    for h in headers:
+        n = _norm_header(h)
+        if n and n != "nan" and n not in norm_to_actual:
+            norm_to_actual[n] = h
     mapping = {}
     for field, aliases in COLUMN_ALIASES.items():
         for a in aliases:
-            if a in lower_to_actual:
-                mapping[field] = lower_to_actual[a]
+            if _norm_header(a) in norm_to_actual:
+                mapping[field] = norm_to_actual[_norm_header(a)]
                 break
 
     missing = [f for f in REQUIRED_FIELDS if f not in mapping]
+    missing_completion = [f for f in COMPLETION_FIELDS if f not in mapping]
     if missing:
-        return df, missing
+        return df, missing, missing_completion
 
     out = pd.DataFrame({field: df[col] for field, col in mapping.items()})
     for field in COLUMN_ALIASES:
@@ -644,7 +741,7 @@ def load_dashboard_excel(file_obj):
     has_name = out["name"].fillna("").astype(str).str.strip() != ""
     has_role = out["role"].fillna("").astype(str).str.strip() != ""
     out = out[has_name & has_role].reset_index(drop=True)
-    return out, []
+    return out, [], missing_completion
 
 
 def build_records(df):
@@ -663,7 +760,11 @@ def build_records(df):
     recs["exam_dt"] = df["exam_date"].apply(parse_date)
     recs["assigned_dt"] = df["assigned"].apply(parse_date)
     recs["eval_last_dt"] = df["eval_last_date"].apply(parse_date)
-    recs["checked"] = df["checked"].apply(parse_int_count)
+    for field in COMPLETION_FIELDS:                      # includes "checked"
+        recs[field] = df[field].apply(parse_int_count)
+    statuses = [completion_status(r) for _, r in recs.iterrows()]
+    recs["complete"] = [s[0] for s in statuses]
+    recs["pending_reason"] = [s[1] for s in statuses]
     return recs
 
 
@@ -804,112 +905,105 @@ def _build_signature_block(styles, page_width, container_inset):
     return sig_table
 
 
+LINE_LEADING = 14     # one uniform line spacing (pt) for every text line in both letters
+LETTER_GAP = 11.5       # one uniform vertical gap (pt) between text blocks (Appointment Letter)
+
+
+def _letter_styles(styles, container_inset, prefix):
+    """
+    Flat paragraph styles (no space before/after, one fixed leading). All vertical rhythm is
+    created explicitly with Spacer(LETTER_GAP) between blocks, so lines inside a block
+    (address lines, Program/Semester/... lines) stay tight and every block gap is identical.
+    """
+    base = ParagraphStyle(
+        f"{prefix}Body",
+        parent=styles["Normal"],
+        fontName="Times-Roman",
+        fontSize=11,
+        leading=LINE_LEADING,
+        leftIndent=container_inset,
+        rightIndent=container_inset,
+        spaceBefore=0,
+        spaceAfter=0,
+        alignment=TA_LEFT,
+    )
+    return {
+        "base": base,
+        "justified": ParagraphStyle(f"{prefix}BodyJ", parent=base, alignment=TA_JUSTIFY),
+        "bold_centre": ParagraphStyle(f"{prefix}Sub", parent=base, fontName="Times-Bold", alignment=TA_CENTER),
+        "date": ParagraphStyle(f"{prefix}Date", parent=base, alignment=TA_RIGHT),
+    }
+
+
 def build_appointment_letter_story(college_key, rec, details, exam_month_year, styles, page_width):
     """Builds flowables for ONE Appointment Letter page (one subject per page)."""
     container_inset = 26.0
     inner_indent = 36.0
+    gap = LETTER_GAP
 
-    base = ParagraphStyle(
-        "Body",
-        parent=styles["Normal"],
-        fontName="Times-Roman",
-        fontSize=11,
-        leading=13.5,
-        leftIndent=container_inset,
-        rightIndent=container_inset,
-        spaceBefore=6,
-        spaceAfter=6,
-        alignment=TA_LEFT,
-    )
-    justified = ParagraphStyle("BodyJ", parent=base, alignment=TA_JUSTIFY)
+    s = _letter_styles(styles, container_inset, "Appt")
+    base, justified = s["base"], s["justified"]
     indented_justified = ParagraphStyle(
-        "BodyIndJ",
-        parent=justified,
-        leftIndent=container_inset + inner_indent,
-    )
-    centred_bold = ParagraphStyle(
-        "Sub",
-        parent=base,
-        fontName="Times-Bold",
-        leftIndent=container_inset,
-        rightIndent=container_inset,
-        alignment=TA_CENTER,
-        spaceBefore=4,
-        spaceAfter=4,
-    )
-    right_date = ParagraphStyle(
-        "Date",
-        parent=base,
-        alignment=TA_RIGHT,
-        spaceBefore=0,
-        spaceAfter=6,
+        "ApptBodyIndJ", parent=justified, leftIndent=container_inset + inner_indent
     )
 
     story = list(build_pdf_letterhead(college_key, styles, page_width))
 
     # 1. Date (right-aligned with superscript ordinal)
-    story.append(Paragraph(rec["date_xml"], right_date))
+    story.append(Paragraph(rec["date_xml"], s["date"]))
+    story.append(Spacer(1, gap))
 
-    # 2. Addressee Block
+    # 2. Addressee block - tight lines, no gaps between them
     story.append(Paragraph("To,", base))
-    addr_lines = build_address_lines(rec["examiner_name"], details)
-    for line in addr_lines:
+    for line in build_address_lines(rec["examiner_name"], details):
         if line and line.strip():
             story.append(Paragraph(_esc(line.strip()), base))
+    story.append(Spacer(1, gap))
 
-    story.append(Spacer(1, 6))
-
-    # 3. Subject Block (updated: single-line with Role and Exam Month & Year)
+    # 3. Subject line
     role = _esc(rec["role"])
     exam_my_esc = _esc(exam_month_year)
     story.append(Paragraph(
         f"Sub: Appointment as Examiner ({role}) for End Semester Examination, {exam_my_esc}",
-        centred_bold,
+        s["bold_centre"],
     ))
+    story.append(Spacer(1, gap))
 
-    story.append(Spacer(1, 6))
-
-    # 4. Salutation & Body (updated wording + Academic Year below Semester)
-    story.append(Paragraph(f"Respected {_esc(rec['salutation'])},", justified))
-
-    story.append(Spacer(1, 6))
+    # 4. Salutation & body
+    story.append(Paragraph(f"Dear {_esc(rec['salutation'])},", justified))
+    story.append(Spacer(1, gap))
 
     story.append(Paragraph(
         f"We are pleased to appoint you as Examiner ({role}) for the End Semester "
-        f"Examination held in {_esc(exam_month_year)}.",
+        f"Examination held in {exam_my_esc}.",
         justified,
     ))
+    story.append(Spacer(1, gap))
 
-    story.append(Spacer(1, 6))
-
+    # Program / Semester / Academic Year / Subject - tight block
     story.append(Paragraph(f"<b>Program:</b> {_esc(rec['course'])}", indented_justified))
     story.append(Paragraph(f"<b>Semester:</b> {_esc(rec['semester'])}", indented_justified))
     story.append(Paragraph(f"<b>Academic Year:</b> {_esc(rec['academic_year'])}", indented_justified))
     story.append(Paragraph(f"<b>Subject:</b> {_esc(rec['subject'])}", indented_justified))
-    
-    story.append(Spacer(1, 6))
-    
+    story.append(Spacer(1, gap))
+
     story.append(Paragraph(
         "The Evaluation is in online mode (Onscreen Marking) for which you will receive an "
         "email after assignment of the evaluation task.",
         justified,
     ))
-    
-    story.append(Spacer(1, 6))
-    
+    story.append(Spacer(1, gap))
+
     story.append(Paragraph(
         "An honorarium, as per the rules will be paid towards the assessment.",
         justified,
     ))
-    
-    story.append(Spacer(1, 6))
-    
+    story.append(Spacer(1, gap))
+
     story.append(Paragraph("Thank you.", justified))
-    story.append(Spacer(1, 14))
+    story.append(Spacer(1, gap))
 
-    story.append(Spacer(1, 6))
-
-    # 5. Signature Block
+    # 5. Signature block
     story.append(_build_signature_block(styles, page_width, container_inset))
     return story
 
@@ -926,67 +1020,51 @@ def build_thanking_letter_story(
     container_inset = 26.0
     n_rows = len(records)
 
-    # Slightly tighten vertical spacing when an examiner has many subjects (e.g. > 5)
+    # Slightly tighten the block gap and table when an examiner has many subjects (> 5)
     compact = n_rows > 5
-    sp_para = 4 if compact else 6
+    gap = 6.0 if compact else LETTER_GAP
     tbl_font_size = 9.5 if compact else 10.5
     tbl_leading = 11.5 if compact else 13.0
     tbl_pad = 2 if compact else 3
 
-    base = ParagraphStyle(
-        "ThankBody",
-        parent=styles["Normal"],
-        fontName="Times-Roman",
-        fontSize=11,
-        leading=13.5,
-        leftIndent=container_inset,
-        rightIndent=container_inset,
-        spaceBefore=sp_para,
-        spaceAfter=sp_para,
-        alignment=TA_LEFT,
-    )
-    justified = ParagraphStyle("ThankBodyJ", parent=base, alignment=TA_JUSTIFY)
-    right_date = ParagraphStyle(
-        "ThankDate",
-        parent=base,
-        alignment=TA_RIGHT,
-        spaceBefore=0,
-        spaceAfter=sp_para,
-    )
+    s = _letter_styles(styles, container_inset, "Thank")
+    base, justified = s["base"], s["justified"]
 
     story = list(build_pdf_letterhead(college_key, styles, page_width))
 
-    # 1. Date (highest Evaluation Last Date or user-picked date, with superscript ordinal)
-    story.append(Paragraph(date_xml, right_date))
+    # 1. Date
+    story.append(Paragraph(date_xml, s["date"]))
+    story.append(Spacer(1, gap))
 
-    # 2. Addressee Block
+    # 2. Addressee block - tight lines, no gaps between them
     story.append(Paragraph("To,", base))
     first_rec = records[0]
-    addr_lines = build_address_lines(first_rec["examiner_name"], details)
-    for line in addr_lines:
+    for line in build_address_lines(first_rec["examiner_name"], details):
         if line and line.strip():
             story.append(Paragraph(_esc(line.strip()), base))
+    story.append(Spacer(1, gap))
 
-    story.append(Spacer(1, sp_para))
-
-    # 3. Salutation & Opening Paragraph (Subject line omitted as requested)
+    # 3. Salutation & opening paragraphs
     roles_txt = " / ".join(dict.fromkeys(r["role"] for r in records))
     role_esc = _esc(roles_txt)
     exam_my_esc = _esc(exam_month_year)
 
-    story.append(Paragraph(f"Respected {_esc(first_rec['salutation'])},", justified))
+    story.append(Paragraph(f"Dear {_esc(first_rec['salutation'])},", justified))
+    story.append(Spacer(1, gap))
     story.append(Paragraph(
         f"We are thankful to you for agreeing to be the {role_esc} at our college for "
         f"the End Semester Examinations held in {exam_my_esc}.",
         justified,
     ))
+    story.append(Spacer(1, gap))
     story.append(Paragraph(
         "The total number of answer books are as mentioned below:",
         justified,
     ))
-    story.append(Spacer(1, 4))
+    story.append(Spacer(1, gap))
 
-    # 4. Table of Subjects: Program | Semester | Subject | No. of Answer books (no Total row)
+    # 4. Table: Program | Semester | Subject | No. of Answer books (no Total row)
+    # splitLongWords=0 -> a header word is never broken in the middle, whatever the column width.
     th_style = ParagraphStyle(
         "TblHeader",
         parent=styles["Normal"],
@@ -994,6 +1072,7 @@ def build_thanking_letter_story(
         fontSize=tbl_font_size,
         leading=tbl_leading,
         alignment=TA_CENTER,
+        splitLongWords=0,
     )
     td_left = ParagraphStyle(
         "TblCellLeft",
@@ -1003,20 +1082,12 @@ def build_thanking_letter_story(
         leading=tbl_leading,
         alignment=TA_LEFT,
     )
-    td_center = ParagraphStyle(
-        "TblCellCenter",
-        parent=styles["Normal"],
-        fontName="Times-Roman",
-        fontSize=tbl_font_size,
-        leading=tbl_leading,
-        alignment=TA_CENTER,
-    )
+    td_center = ParagraphStyle("TblCellCenter", parent=td_left, alignment=TA_CENTER)
 
+    # Header lines: any wrapping happens only at the explicit <br/>, never inside a word
+    header_lines = [["Program"], ["Semester"], ["Subject"], ["No. of", "Answer books"]]
     table_data = [[
-        Paragraph("<b>Program</b>", th_style),
-        Paragraph("<b>Semester</b>", th_style),
-        Paragraph("<b>Subject</b>", th_style),
-        Paragraph("<b>No. of Answer books</b>", th_style),
+        Paragraph("<b>" + "<br/>".join(lines) + "</b>", th_style) for lines in header_lines
     ]]
     for r in records:
         table_data.append([
@@ -1027,12 +1098,20 @@ def build_thanking_letter_story(
         ])
 
     tbl_width = page_width - 2 * container_inset
-    col_widths = [
-        tbl_width * 0.38,
-        tbl_width * 0.12,
-        tbl_width * 0.32,
-        tbl_width * 0.16,
+    cell_pad = 5 + 5
+    min_widths = [
+        max(stringWidth(line, "Times-Bold", tbl_font_size) for line in lines) + cell_pad + 6
+        for lines in header_lines
     ]
+    col_widths = [
+        max(tbl_width * pct, mn) for pct, mn in zip((0.38, 0.12, 0.32, 0.16), min_widths)
+    ]
+    excess = sum(col_widths) - tbl_width
+    if excess > 0:   # take the surplus from the wide text columns (Program, Subject)
+        flex_total = col_widths[0] + col_widths[2]
+        col_widths[0] -= excess * col_widths[0] / flex_total
+        col_widths[2] -= excess * col_widths[2] / flex_total
+
     subj_table = Table(table_data, colWidths=col_widths, repeatRows=1)
     subj_table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
@@ -1052,20 +1131,21 @@ def build_thanking_letter_story(
         ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
     ]))
     story.append(wrapper_table)
-    story.append(Spacer(1, 4))
+    story.append(Spacer(1, gap))
 
-    # 5. Closing Paragraphs
+    # 5. Closing paragraphs
     story.append(Paragraph(
         "The efforts that you have taken and the time you have spared for this task are truly appreciated.",
         justified,
     ))
+    story.append(Spacer(1, gap))
     story.append(Paragraph(
         "Thank you once again and looking forward to your continued support.",
         justified,
     ))
-    story.append(Spacer(1, 10 if compact else 14))
+    story.append(Spacer(1, gap))
 
-    # 6. Signature Block
+    # 6. Signature block
     story.append(_build_signature_block(styles, page_width, container_inset))
 
     # Guarantee everything stays on a single page even for 12+ rows
@@ -1087,6 +1167,14 @@ def generate_letter_pdf(
     - Thanking Letter PDF (single page with all subjects in a table), or
     - All Letters PDF (all Appointment Letters followed by the Thanking Letter on the last page).
     """
+    if letter_type in ("Thanking Letter", "All Letters"):
+        not_done = [r for r in records if not r.get("complete", False)]
+        if not_done:
+            raise ValueError(
+                "Thanking Letter cannot be generated - evaluation not completed for: "
+                + "; ".join(f"{r['subject']} ({r.get('pending_reason') or 'status unknown'})" for r in not_done)
+            )
+
     extract_college_assets_from_docx(college_key)
     cfg = COLLEGE_CONFIGS[college_key]
 
@@ -1152,27 +1240,70 @@ def show():
     st.subheader("✉️ Letters to External Examiners")
 
     # ------------------------------------------------------------------
-    # Top Bar: 1. Select College & 2. Upload Evaluation Dashboard Excel
+    # Upload Evaluation Dashboard Excel - the college is identified automatically
     # ------------------------------------------------------------------
-    top_c1, top_c2 = st.columns([1.2, 1.3])
+    excel_file = st.file_uploader(
+        "Upload Evaluation Dashboard (.xlsx)",
+        type=["xlsx", "xls"],
+        key="dashboard_excel_uploader",
+    )
 
-    with top_c1:
+    if excel_file is None:
+        st.info("\U0001F446 Upload the Evaluation Dashboard Excel file — the college is identified automatically "
+                "from the 5-digit codes in the Course column.")
+        return
+
+    try:
+        df_raw, missing, missing_completion = load_dashboard_excel(excel_file)
+    except Exception as e:
+        st.error(f"Error loading Excel file: {e}")
+        return
+
+    if missing:
+        nice = {
+            "name": "Examiner Name",
+            "role": "Role",
+            "course": "Course",
+            "semester": "Semester/Trimester",
+            "subject": "Subject",
+        }
+        st.error("Missing required column(s): " + ", ".join(nice[m] for m in missing))
+        return
+
+    # ------------------------------------------------------------------
+    # College auto-detection from Course codes
+    # ------------------------------------------------------------------
+    detected_key, code_hits, unknown_codes = detect_college(df_raw["course"])
+    matched_colleges = [k for k, c in code_hits.items() if c]
+
+    if len(matched_colleges) > 1:
+        st.error(
+            "This file contains Course codes of more than one college ("
+            + ", ".join(f"{k}: {sum(code_hits[k].values())} row(s)" for k in matched_colleges)
+            + "). Please upload a file that belongs to a single college."
+        )
+        return
+
+    if detected_key is None:
+        st.warning(
+            "Could not identify the college from the Course codes"
+            + (f" (codes found: {', '.join(sorted(unknown_codes))})" if unknown_codes else " (no 5-digit code found)")
+            + ". Please select the college manually."
+        )
         college_key = st.selectbox(
-            "1. Select College",
+            "Select College",
             options=list(COLLEGE_CONFIGS.keys()),
             format_func=lambda k: COLLEGE_CONFIGS[k]["ui_label"],
-            key="selected_college",
+            key="manual_college",
         )
+    else:
+        college_key = detected_key
+        st.success(f"\U0001F3EB College identified from Course codes: **{COLLEGE_CONFIGS[college_key]['ui_label']}**")
+        if unknown_codes:
+            st.caption(f"Unrecognised Course code(s) ignored: {', '.join(sorted(unknown_codes))}")
     college_cfg = COLLEGE_CONFIGS[college_key]
 
-    with top_c2:
-        excel_file = st.file_uploader(
-            "2. Upload Evaluation Dashboard (.xlsx)",
-            type=["xlsx", "xls"],
-            key="dashboard_excel_uploader",
-        )
-
-    # Ensure logos & signature for the chosen college are available
+    # Ensure logos & signature for the detected college are available
     assets_ok = extract_college_assets_from_docx(college_key)
     if not assets_ok:
         with st.expander(
@@ -1190,27 +1321,6 @@ def show():
                     st.rerun()
                 else:
                     st.error("Could not extract all required images from the uploaded Word file.")
-
-    if excel_file is None:
-        st.info("\U0001F446 Select the college and upload the Evaluation Dashboard Excel file.")
-        return
-
-    try:
-        df_raw, missing = load_dashboard_excel(excel_file)
-    except Exception as e:
-        st.error(f"Error loading Excel file: {e}")
-        return
-
-    if missing:
-        nice = {
-            "name": "Examiner Name",
-            "role": "Role",
-            "course": "Course",
-            "semester": "Semester/Trimester",
-            "subject": "Subject",
-        }
-        st.error("Missing required column(s): " + ", ".join(nice[m] for m in missing))
-        return
 
     recs = build_records(df_raw)
     recs["eligible"] = recs["raw_role"].apply(is_eligible_role)
@@ -1248,10 +1358,11 @@ def show():
 
         def subj_label(i):
             r = ex_rows.iloc[i]
-            return f"{r['role']} | {r['semester']} | {r['subject']} ({r['course']}) — Checked: {r['checked']}"
+            status = "✅" if r["complete"] else "⏳"
+            return f"{status} {r['role']} | {r['semester']} | {r['subject']} ({r['course']}) — Checked: {r['checked']}"
 
         chosen_idx = st.multiselect(
-            "Subjects to include",
+            "Subjects to include   (✅ evaluation completed · ⏳ pending)",
             list(range(len(ex_rows))),
             default=list(range(len(ex_rows))),
             format_func=subj_label,
@@ -1397,6 +1508,8 @@ def show():
             "subject": r["subject"],
             "academic_year": ay_override or r["academic_year"],
             "checked": r["checked"],
+            "complete": bool(r["complete"]),
+            "pending_reason": r["pending_reason"],
             "salutation": salutation,
             "date_text": fmt_date_plain(appt_dt),
             "date_xml": fmt_date_xml(appt_dt),
@@ -1414,8 +1527,13 @@ def show():
     }
 
     with st.expander(f"\U0001F4CB Preview Selected Data ({len(final_records)} subject(s))", expanded=False):
-        preview_df = pd.DataFrame(final_records)[
-            ["date_text", "thank_date_text", "examiner_name", "role", "course", "semester", "subject", "checked"]
+        preview_df = pd.DataFrame(final_records)
+        preview_df["status"] = preview_df.apply(
+            lambda x: "✅ Completed" if x["complete"] else f"⏳ {x['pending_reason']}", axis=1
+        )
+        preview_df = preview_df[
+            ["date_text", "thank_date_text", "examiner_name", "role", "course", "semester",
+             "subject", "checked", "status"]
         ].rename(columns={
             "date_text": "Appt. Date",
             "thank_date_text": "Thanking Date",
@@ -1425,33 +1543,81 @@ def show():
             "semester": "Semester",
             "subject": "Subject",
             "checked": "No. of Answer books",
+            "status": "Evaluation Status",
         })
         st.dataframe(preview_df, use_container_width=True, hide_index=True)
 
     # ------------------------------------------------------------------
-    # Single Generation Button: all Appointment Letters + Thanking Letter (last page)
+    # Which letters? Thanking Letter only when ALL selected evaluations are completed
     # ------------------------------------------------------------------
-    base_sig = repr((college_key, sel_key, final_records, details, thank_date_xml, exam_month_year))
+    pending_records = [r for r in final_records if not r["complete"]]
+    thanking_ok = (not missing_completion) and (not pending_records)
+
+    with st.container(border=True):
+        st.caption("**Letters to generate**")
+        l_c1, l_c2 = st.columns(2)
+        want_appt = l_c1.checkbox(
+            "Appointment Letter(s)",
+            value=True,
+            key=f"want_appt_{sel_key}",
+        )
+        want_thank = l_c2.checkbox(
+            "Thanking Letter",
+            value=thanking_ok,
+            disabled=not thanking_ok,
+            key=f"want_thank_{sel_key}_{int(thanking_ok)}",
+        )
+        want_thank = want_thank and thanking_ok
+
+        if missing_completion:
+            st.warning(
+                "Thanking Letter is unavailable: the Excel file has no column for "
+                + ", ".join(COMPLETION_LABELS[f] for f in missing_completion) + "."
+            )
+        elif pending_records:
+            st.warning(
+                "Thanking Letter is unavailable until the selected evaluation(s) are completed "
+                "(Unchecked, Rejected and In Progress must be 0 and Present = Uploaded = Checked):\n\n"
+                + "\n".join(
+                    f"- {r['role']} | {r['semester']} | {r['subject']} — {r['pending_reason']}"
+                    for r in pending_records
+                )
+            )
+
+    if want_appt and want_thank:
+        letter_type, file_tag, letters_label = "All Letters", "Letters", "Appointment + Thanking Letters"
+    elif want_appt:
+        letter_type, file_tag, letters_label = "Appointment Letter", "Appointment_Letters", "Appointment Letter(s)"
+    elif want_thank:
+        letter_type, file_tag, letters_label = "Thanking Letter", "Thanking_Letter", "Thanking Letter"
+    else:
+        st.warning("Select at least one letter to generate.")
+        return
+
+    # ------------------------------------------------------------------
+    # Generation button
+    # ------------------------------------------------------------------
+    base_sig = repr((college_key, sel_key, letter_type, final_records, details, thank_date_xml, exam_month_year))
     clean_name = re.sub(r"[^A-Za-z0-9]+", "_", letter_name.strip() or default_name).strip("_")
 
-    gen_all = st.button(
-        "⚡ Generate All Letters (Appointment + Thanking) — Single PDF",
+    gen_btn = st.button(
+        f"⚡ Generate {letters_label} — PDF",
         type="primary",
         use_container_width=True,
     )
 
-    if gen_all:
+    if gen_btn:
         try:
             st.session_state["appt_pdf"] = generate_letter_pdf(
                 college_key=college_key,
-                letter_type="All Letters",
+                letter_type=letter_type,
                 records=final_records,
                 details=details,
                 thank_date_xml=thank_date_xml,
                 exam_month_year=exam_month_year,
             )
             st.session_state["appt_sig"] = base_sig
-            st.session_state["pdf_filename"] = f"{college_cfg['code']}_Letters_{clean_name}.pdf"
+            st.session_state["pdf_filename"] = f"{college_cfg['code']}_{file_tag}_{clean_name}.pdf"
         except Exception as e:
             st.error(f"PDF generation failed: {e}")
 
@@ -1461,9 +1627,13 @@ def show():
             st.caption("ℹ️ Inputs changed since last generation — click the generate button above.")
         return
 
-    active_filename = st.session_state.get("pdf_filename", f"{college_cfg['code']}_Letters_{clean_name}.pdf")
-    n_pages = len(final_records) + 1
-    st.caption(f"{len(final_records)} appointment letter page(s) + 1 thanking letter page = {n_pages} page(s).")
+    active_filename = st.session_state.get("pdf_filename", f"{college_cfg['code']}_{file_tag}_{clean_name}.pdf")
+    n_appt_pages = len(final_records) if want_appt else 0
+    n_thank_pages = 1 if want_thank else 0
+    st.caption(
+        f"{n_appt_pages} appointment letter page(s) + {n_thank_pages} thanking letter page(s) "
+        f"= {n_appt_pages + n_thank_pages} page(s)."
+    )
 
     st.download_button(
         label=f"\U0001F4C4 Download {active_filename}",
@@ -1474,28 +1644,51 @@ def show():
     )
 
     # ------------------------------------------------------------------
-    # Compact Email Section
+    # Compact Email Section (always matches the letters contained in the generated PDF)
     # ------------------------------------------------------------------
     with st.container(border=True):
-        st.caption("**Send Letters (Appointment + Thanking) via Email** — use the .eml draft for an auto-attached PDF, or the buttons (PDF must be attached manually).")
+        st.caption(f"**Send {letters_label} via Email** — use the .eml draft for an auto-attached PDF, or the buttons (PDF must be attached manually).")
         excel_email = ex_rows["examiner_email"].iloc[0] if len(ex_rows) else ""
         roles_txt = " / ".join(dict.fromkeys(r["role"] for r in final_records))
-        subj_word = "subject" if len(final_records) == 1 else "subjects"
+        n_subj = len(final_records)
+        subj_word = "subject" if n_subj == 1 else "subjects"
+        plural_s = "" if n_subj == 1 else "s"
 
-        email_subject = (
-            f"Appointment & Thanking Letters ({college_cfg['code']}) - {roles_txt} - "
-            f"End Semester Examinations ({exam_month_year})"
-        )
+        if letter_type == "All Letters":
+            email_subject = (
+                f"Appointment & Thanking Letters ({college_cfg['code']}) - {roles_txt} - "
+                f"End Semester Examinations ({exam_month_year})"
+            )
+            attach_para = (
+                f"Please find attached your appointment letter(s) as {roles_txt} for the End Semester "
+                f"Examination ({n_subj} {subj_word}), followed by our letter of appreciation "
+                f"for your valuable contribution to the End Semester Examinations held in {exam_month_year}."
+            )
+        elif letter_type == "Appointment Letter":
+            email_subject = (
+                f"Appointment Letter{plural_s} ({college_cfg['code']}) - {roles_txt} - "
+                f"End Semester Examinations ({exam_month_year})"
+            )
+            attach_para = (
+                f"Please find attached your appointment letter{plural_s} as {roles_txt} for the End Semester "
+                f"Examination ({n_subj} {subj_word})."
+            )
+        else:
+            email_subject = (
+                f"Thanking Letter ({college_cfg['code']}) - {roles_txt} - "
+                f"End Semester Examinations ({exam_month_year})"
+            )
+            attach_para = (
+                f"Please find attached our letter of appreciation for your valuable contribution as "
+                f"{roles_txt} to the End Semester Examinations held in {exam_month_year}."
+            )
+
         default_body = (
             f"Dear {salutation},\n\n"
             f"Greetings from the Examination Department, {college_cfg['short_name']}.\n\n"
-            f"Please find attached your appointment letter(s) as {roles_txt} for the End Semester "
-            f"Examination ({len(final_records)} {subj_word}), followed by our letter of appreciation "
-            f"for your valuable contribution to the End Semester Examinations held in {exam_month_year}.\n\n"
+            f"{attach_para}\n\n"
             f"If you have any queries, please feel free to reach out to the Examination Cell.\n\n"
-            f"Warm regards,\n"
-            f"{SIGNATORY['title']}\n"
-            f"{college_cfg['short_name']}"
+            f"Warm regards.\n"            
         )
 
         email_to = st.text_input("Recipient Email", value=excel_email, key=f"email_{sel_key}")
@@ -1503,7 +1696,7 @@ def show():
             "Email Message",
             value=default_body,
             height=155,
-            key=f"emailbody_{college_key}_{sel_key}_{salutation.replace('/', '_')}",
+            key=f"emailbody_{college_key}_{sel_key}_{salutation.replace('/', '_')}_{file_tag}",
         )
 
         encoded_subject = urllib.parse.quote(email_subject)
