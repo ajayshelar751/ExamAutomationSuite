@@ -18,7 +18,9 @@ from PIL import Image as PILImage
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import inch, cm
-from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.pdfmetrics import stringWidth, registerFontFamily
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepInFrame
 )
@@ -43,6 +45,56 @@ SIGNATORY = {
     "title": "Controller of Examination",
     "signature_image": os.path.join(ASSET_DIR, "signature.png"),  # 0.86" x 0.43"
 }
+
+
+
+def _register_bookman_fonts():
+    """
+    Registers 'BookmanOldStyle' / 'BookmanOldStyle-Bold' for DJSCE letterhead.
+    Prefers installed Bookman Old Style (.ttf/.otf) and falls back to system URW Bookman (.otf)
+    or Times-Roman / Times-Bold if no font file is present.
+    """
+    reg_candidates = [
+        os.path.join(BASE_DIR, "fonts", "BOOKOS.TTF"),
+        os.path.join(BASE_DIR, "BOOKOS.TTF"),
+        r"C:\Windows\Fonts\BOOKOS.TTF",
+        "/Library/Fonts/Bookman Old Style.ttf",
+        "/System/Library/Fonts/Supplemental/Bookman Old Style.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Bookman_Old_Style.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+    ]
+    bold_candidates = [
+        os.path.join(BASE_DIR, "fonts", "BOOKOSB.TTF"),
+        os.path.join(BASE_DIR, "BOOKOSB.TTF"),
+        r"C:\Windows\Fonts\BOOKOSB.TTF",
+        r"C:\Windows\Fonts\BOOKOSBI.TTF",
+        "/Library/Fonts/Bookman Old Style Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Bookman Old Style Bold.ttf",
+        "/usr/share/fonts/truetype/msttcorefonts/Bookman_Old_Style_Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+    ]
+    reg_path = next((p for p in reg_candidates if os.path.isfile(p)), None)
+    bold_path = next((p for p in bold_candidates if os.path.isfile(p)), None)
+    if reg_path and bold_path:
+        try:
+            pdfmetrics.registerFont(TTFont("BookmanOldStyle", reg_path))
+            pdfmetrics.registerFont(TTFont("BookmanOldStyle-Bold", bold_path))
+            registerFontFamily(
+                "BookmanOldStyle",
+                normal="BookmanOldStyle",
+                bold="BookmanOldStyle-Bold",
+                italic="BookmanOldStyle",
+                boldItalic="BookmanOldStyle-Bold",
+            )
+            return "BookmanOldStyle", "BookmanOldStyle-Bold"
+        except Exception:
+            pass
+    return "Times-Roman", "Times-Bold"
+
+
+BOOKMAN_REGULAR, BOOKMAN_BOLD = _register_bookman_fonts()
 
 COLLEGE_CONFIGS = {
     "UPG": {
@@ -193,6 +245,60 @@ COLLEGE_CONFIGS = {
             },
         ],
     },
+    "DJSCE": {
+        "code": "DJSCE",
+        "ui_label": "DJSCE — Dwarkadas J. Sanghvi College of Engineering",
+        "short_name": "Dwarkadas J. Sanghvi College of Engineering",
+        "docx_candidates": [
+            "DJSCE Letter Head.docx",
+            "DJSCE_Letter_Head.docx",
+            "DJSCE Appointment Letter Format.docx",
+        ],
+        "left_logo_size": (0.6785 * inch, 0.8661 * inch),
+        "right_logo": os.path.join(ASSET_DIR, "djsce_logo.png"),
+        "right_logo_size": (0.7874 * inch, 0.7874 * inch),
+        "left_col_w": 56.45,
+        "right_col_w": 55.8,
+        "text_align": TA_LEFT,
+        "center_line_below": False,
+        "right_valign": "BOTTOM",
+        "right_align": "RIGHT",
+        "header_lines": [
+            {
+                "text": "Shri Vile Parle Kelavani Mandal's",
+                "font": BOOKMAN_REGULAR,
+                "size": 11,
+                "leading": 13.0,
+                "color": "#1F4E79",
+                "spaceAfter": 1.0,
+            },
+            {
+                "text": "DWARKADAS J. SANGHVI COLLEGE OF ENGINEERING",
+                "font": BOOKMAN_BOLD,
+                "size": 13.0 if BOOKMAN_BOLD == "BookmanOldStyle-Bold" else 14,
+                "leading": 16.0,
+                "color": "#000000",
+                "underline_border": True,
+                "spaceAfter": 2.0,
+            },
+            {
+                "text": "(Empowered Autonomous College Affiliated to University of Mumbai)",
+                "font": BOOKMAN_REGULAR,
+                "size": 11,
+                "leading": 13.0,
+                "color": "#1F4E79",
+                "spaceAfter": 1.0,
+            },
+            {
+                "text": "NAAC Accredited with “A” Grade (CGPA: 3.18)",
+                "font": BOOKMAN_REGULAR,
+                "size": 10,
+                "leading": 12.0,
+                "color": "#1F4E79",
+                "spaceAfter": 1.0,
+            },
+        ],
+    },
 }
 
 # Letters are generated ONLY for these roles (case-insensitive substring match)
@@ -227,6 +333,10 @@ COLLEGE_COURSE_CODES = {
         "40726", "40727", "40761", "40762", "40763", "40764", "40765", "40766",
         "40767", "40768", "40769", "40771", "40772", "40774", "40775", "40777",
         "40778", "40779",
+    },
+    "DJSCE": {
+        "60001", "60011", "60002", "60003", "60004", "60005", "60012", "60013",
+        "60009", "60017", "60018", "60019", "60006", "60007", "60008",
     },
 }
 COURSE_CODE_TO_COLLEGE = {
@@ -315,7 +425,6 @@ def extract_college_assets_from_docx(college_key, docx_file_or_path=None):
         docx_file_or_path is None
         and os.path.isfile(SVKM_LOGO_PATH)
         and os.path.isfile(right_logo_path)
-        and os.path.isfile(sig_path)
     ):
         return True
 
@@ -334,30 +443,36 @@ def extract_college_assets_from_docx(college_key, docx_file_or_path=None):
         try:
             with zipfile.ZipFile(source, "r") as z:
                 namelist = z.namelist()
-                if "word/media/image2.png" in namelist and not os.path.isfile(SVKM_LOGO_PATH):
-                    _save_image_for_reportlab(z.read("word/media/image2.png"), SVKM_LOGO_PATH, crop_svkm=True)
+                if college_key == "DJSCE":
+                    if "word/media/image1.png" in namelist and (
+                        docx_file_or_path is not None or not os.path.isfile(SVKM_LOGO_PATH)
+                    ):
+                        _save_image_for_reportlab(z.read("word/media/image1.png"), SVKM_LOGO_PATH, crop_svkm=True)
+                    if "word/media/image2.png" in namelist and (
+                        docx_file_or_path is not None or not os.path.isfile(right_logo_path)
+                    ):
+                        _save_image_for_reportlab(z.read("word/media/image2.png"), right_logo_path, crop_svkm=False)
+                else:
+                    if "word/media/image2.png" in namelist and not os.path.isfile(SVKM_LOGO_PATH):
+                        _save_image_for_reportlab(z.read("word/media/image2.png"), SVKM_LOGO_PATH, crop_svkm=True)
 
-                for media_item in ("word/media/image3.jpeg", "word/media/image3.png"):
-                    if media_item in namelist and (docx_file_or_path is not None or not os.path.isfile(right_logo_path)):
-                        _save_image_for_reportlab(z.read(media_item), right_logo_path, crop_svkm=False)
-                        break
+                    for media_item in ("word/media/image3.jpeg", "word/media/image3.png"):
+                        if media_item in namelist and (docx_file_or_path is not None or not os.path.isfile(right_logo_path)):
+                            _save_image_for_reportlab(z.read(media_item), right_logo_path, crop_svkm=False)
+                            break
 
-                if "word/media/image1.emf" in namelist and not os.path.isfile(sig_path):
-                    png_data = _extract_png_from_emf(z.read("word/media/image1.emf"))
-                    if png_data:
+                    if "word/media/image1.emf" in namelist and not os.path.isfile(sig_path):
+                        png_data = _extract_png_from_emf(z.read("word/media/image1.emf"))
+                        if png_data:
+                            with open(sig_path, "wb") as f:
+                                f.write(png_data)
+                    elif "word/media/image1.png" in namelist and not os.path.isfile(sig_path):
                         with open(sig_path, "wb") as f:
-                            f.write(png_data)
-                elif "word/media/image1.png" in namelist and not os.path.isfile(sig_path):
-                    with open(sig_path, "wb") as f:
-                        f.write(z.read("word/media/image1.png"))
+                            f.write(z.read("word/media/image1.png"))
         except Exception:
             pass
 
-    return (
-        os.path.isfile(SVKM_LOGO_PATH)
-        and os.path.isfile(right_logo_path)
-        and os.path.isfile(sig_path)
-    )
+    return os.path.isfile(SVKM_LOGO_PATH) and os.path.isfile(right_logo_path)
 
 
 # Pre-extract assets for all colleges on startup if .docx files are present
@@ -826,14 +941,15 @@ def _img(path, w, h, align="CENTER"):
 
 def build_pdf_letterhead(college_key, styles, page_width):
     """
-    Replicates the 3-column header table from each college's Word file with a 1.25pt
-    bottom border under the center text column.
+    Replicates the 3-column header table from each college's Word file with exact
+    alignment, font family, font sizes, colors, and border placement.
     """
     cfg = COLLEGE_CONFIGS[college_key]
 
-    left_col_w = 0.785 * inch
-    right_col_w = 0.775 * inch
+    left_col_w = cfg.get("left_col_w", 0.785 * inch)
+    right_col_w = cfg.get("right_col_w", 0.775 * inch)
     center_col_w = page_width - left_col_w - right_col_w
+    text_align = cfg.get("text_align", TA_CENTER)
 
     center_flowables = []
     for idx, line_cfg in enumerate(cfg["header_lines"]):
@@ -844,31 +960,51 @@ def build_pdf_letterhead(college_key, styles, page_width):
             fontSize=line_cfg["size"],
             leading=line_cfg["leading"],
             textColor=colors.HexColor(line_cfg["color"]),
-            alignment=TA_CENTER,
+            alignment=text_align,
             spaceBefore=0,
             spaceAfter=line_cfg.get("spaceAfter", 1),
         )
-        center_flowables.append(Paragraph(line_cfg["text"], st_line))
+        p = Paragraph(line_cfg["text"], st_line)
+        if line_cfg.get("underline_border"):
+            # Replicates Word paragraph bottom border (<w:pBdr><w:bottom w:val="single" w:sz="12"/></w:pBdr>)
+            bdr_tbl = Table([[p]], colWidths=[center_col_w - 3.0])
+            bdr_tbl.setStyle(TableStyle([
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+                ("LINEBELOW", (0, 0), (0, 0), 1.5, colors.black),
+            ]))
+            center_flowables.append(bdr_tbl)
+            center_flowables.append(Spacer(1, line_cfg.get("spaceAfter", 1)))
+        else:
+            center_flowables.append(p)
 
-    left_logo = _img(SVKM_LOGO_PATH, 0.68 * inch, 0.87 * inch, "CENTER")
+    lw, lh = cfg.get("left_logo_size", (0.68 * inch, 0.87 * inch))
+    left_logo = _img(SVKM_LOGO_PATH, lw, lh, "CENTER")
     rw, rh = cfg["right_logo_size"]
-    right_logo = _img(cfg["right_logo"], rw, rh, "CENTER")
+    right_align = cfg.get("right_align", "CENTER")
+    right_valign = cfg.get("right_valign", "MIDDLE")
+    right_logo = _img(cfg["right_logo"], rw, rh, right_align)
+
+    tbl_cmds = [
+        ("VALIGN", (0, 0), (1, 0), "MIDDLE"),
+        ("VALIGN", (2, 0), (2, 0), right_valign),
+        ("ALIGN", (0, 0), (0, 0), "CENTER"),
+        ("ALIGN", (2, 0), (2, 0), right_align),
+        ("LEFTPADDING", (0, 0), (-1, -1), 1.5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 1.5),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]
+    if cfg.get("center_line_below", True):
+        tbl_cmds.append(("LINEBELOW", (1, 0), (1, 0), 1.25, colors.black))
 
     t = Table(
         [[left_logo, center_flowables, right_logo]],
         colWidths=[left_col_w, center_col_w, right_col_w],
     )
-    t.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN", (0, 0), (0, 0), "CENTER"),
-        ("ALIGN", (2, 0), (2, 0), "CENTER"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 1.5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 1.5),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        # 1.25pt bottom border beneath the center text cell as requested
-        ("LINEBELOW", (1, 0), (1, 0), 1.25, colors.black),
-    ]))
+    t.setStyle(TableStyle(tbl_cmds))
     return [t, Spacer(1, 0.18 * inch)]
 
 
