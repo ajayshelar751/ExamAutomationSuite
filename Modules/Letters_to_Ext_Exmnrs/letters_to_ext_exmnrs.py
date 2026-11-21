@@ -17,7 +17,7 @@ from PIL import Image as PILImage
 # ReportLab imports for dynamic PDF generation
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.lib.units import inch
+from reportlab.lib.units import inch, cm
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak, KeepInFrame
@@ -518,14 +518,14 @@ def format_academic_year(value):
 def format_role(value):
     """
     Normalizes role names for letters:
-    - Any role containing 'reval' (e.g. 'Reval 1', 'Reval 2', 'Revaluation') becomes 'Revaluator'.
+    - Any role containing 'reval' (e.g. 'Reval 1', 'Reval 2', 'Revaluation') becomes 'Examiner (Revaluation)'.
     - 'Moderator' stays 'Moderator'.
     """
     if value is None or (not isinstance(value, str) and pd.isna(value)):
         return ""
     s = re.sub(r"\s+", " ", str(value)).strip()
     if "reval" in s.lower():
-        return "Revaluator"
+        return "Examiner (Revaluation)"
     if "moderator" in s.lower():
         return "Moderator"
     return s.title()
@@ -873,36 +873,38 @@ def build_pdf_letterhead(college_key, styles, page_width):
 
 
 def _build_signature_block(styles, page_width, container_inset):
-    """Builds the Controller of Examination signature table."""
+    """Builds the Controller of Examination signature block aligned identically to the letter body."""
     sig_text_style = ParagraphStyle(
         "SigText",
         parent=styles["Normal"],
         fontName="Times-Roman",
         fontSize=11,
-        leading=13.2,
-        leftIndent=0,
+        leading=LINE_LEADING,
+        leftIndent=container_inset,
+        rightIndent=container_inset,
         spaceBefore=0,
         spaceAfter=0,
         alignment=TA_LEFT,
     )
-    sig_cell_contents = []
+    sig_items = []
     if os.path.isfile(SIGNATORY["signature_image"]):
-        sig_cell_contents.append(_img(SIGNATORY["signature_image"], 0.86 * inch, 0.43 * inch, "LEFT"))
+        sig_img = _img(SIGNATORY["signature_image"], 0.86 * inch, 0.43 * inch, "LEFT")
+        # Indent image to match body left margin by wrapping in a full-width table with container_inset left padding
+        img_tbl = Table([[sig_img]], colWidths=[page_width])
+        img_tbl.setStyle(TableStyle([
+            ("LEFTPADDING", (0, 0), (-1, -1), container_inset),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ("TOPPADDING", (0, 0), (-1, -1), 0),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        sig_items.append(img_tbl)
     else:
-        sig_cell_contents.append(Spacer(1, 0.43 * inch))
-    sig_cell_contents.append(Paragraph(_esc(SIGNATORY["name"]), sig_text_style))
-    sig_cell_contents.append(Paragraph(_esc(SIGNATORY["title"]), sig_text_style))
-
-    sig_table = Table([[sig_cell_contents]], colWidths=[page_width])
-    sig_table.setStyle(TableStyle([
-        ("LEFTPADDING", (0, 0), (-1, -1), container_inset),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-    ]))
-    return sig_table
+        sig_items.append(Spacer(1, 0.43 * inch))
+    sig_items.append(Paragraph(_esc(SIGNATORY["name"]), sig_text_style))
+    sig_items.append(Paragraph(_esc(SIGNATORY["title"]), sig_text_style))
+    return sig_items
 
 
 LINE_LEADING = 14     # one uniform line spacing (pt) for every text line in both letters
@@ -935,17 +937,92 @@ def _letter_styles(styles, container_inset, prefix):
     }
 
 
+def _assignment_club_key(rec):
+    """
+    Key for clubbing Present count when an examiner has the same Subject,
+    Course, Semester/Trimester, Exam Date, and Academic Year (and Role).
+    """
+    exam_dt = _to_dt(rec.get("exam_dt"))
+    exam_key = exam_dt.strftime("%Y-%m-%d") if exam_dt else str(rec.get("exam_date_text") or "").strip().lower()
+    return (
+        str(rec.get("role") or "").strip().lower(),
+        str(rec.get("course") or "").strip().lower(),
+        str(rec.get("semester") or "").strip().lower(),
+        str(rec.get("subject") or "").strip().lower(),
+        exam_key,
+        str(rec.get("academic_year") or "").strip().lower(),
+    )
+
+
+def club_duplicate_records(records):
+    """
+    Clubs Present count (and Checked/Uploaded/Unchecked/Rejected/In Progress counts where applicable)
+    for records sharing the same Subject, Course, Semester/Trimester, Exam Date, and Academic Year.
+    Preserves chronological order (by assigned_dt) and keeps completion status accurate.
+    """
+    if not records:
+        return []
+    ordered = sort_by_assigned(records)
+    grouped = {}
+    order_keys = []
+    for r in ordered:
+        k = _assignment_club_key(r)
+        if k not in grouped:
+            grouped[k] = []
+            order_keys.append(k)
+        grouped[k].append(dict(r))
+
+    clubbed = []
+    for k in order_keys:
+        bucket = grouped[k]
+        if len(bucket) == 1:
+            base_r = bucket[0]
+            base_r.setdefault("present_clubbed", parse_int_count(base_r.get("present", base_r.get("checked", 0))))
+            clubbed.append(base_r)
+            continue
+
+        lead = dict(bucket[0])
+        total_present = sum(parse_int_count(item.get("present", 0)) for item in bucket)
+        total_checked = sum(parse_int_count(item.get("checked", 0)) for item in bucket)
+        total_uploaded = sum(parse_int_count(item.get("uploaded", 0)) for item in bucket)
+        total_unchecked = sum(parse_int_count(item.get("unchecked", 0)) for item in bucket)
+        total_rejected = sum(parse_int_count(item.get("rejected", 0)) for item in bucket)
+        total_in_progress = sum(parse_int_count(item.get("in_progress", 0)) for item in bucket)
+
+        # Earliest assigned date for appointment letter if available
+        dts = [_to_dt(item.get("assigned_dt")) for item in bucket if _to_dt(item.get("assigned_dt")) is not None]
+        if dts:
+            earliest_dt = min(dts)
+            lead["assigned_dt"] = earliest_dt
+            lead["date_text"] = fmt_date_plain(earliest_dt)
+            lead["date_xml"] = fmt_date_xml(earliest_dt)
+
+        lead["present"] = total_present
+        lead["present_clubbed"] = total_present
+        lead["checked"] = total_checked
+        lead["uploaded"] = total_uploaded
+        lead["unchecked"] = total_unchecked
+        lead["rejected"] = total_rejected
+        lead["in_progress"] = total_in_progress
+
+        all_complete = all(bool(item.get("complete", False)) for item in bucket)
+        reasons = [str(item.get("pending_reason") or "").strip() for item in bucket if not item.get("complete", False)]
+        lead["complete"] = all_complete
+        lead["pending_reason"] = "; ".join(dict.fromkeys(r for r in reasons if r))
+        clubbed.append(lead)
+
+    return clubbed
+
+
 def build_appointment_letter_story(college_key, rec, details, exam_month_year, styles, page_width):
     """Builds flowables for ONE Appointment Letter page (one subject per page)."""
     container_inset = 26.0
-    inner_indent = 36.0
     gap = LETTER_GAP
 
     s = _letter_styles(styles, container_inset, "Appt")
     base, justified = s["base"], s["justified"]
-    indented_justified = ParagraphStyle(
-        "ApptBodyIndJ", parent=justified, leftIndent=container_inset + inner_indent
-    )
+    # Double line spacing (2.0 x 11pt = 22pt) strictly for the body paragraphs of the Appointment Letter
+    body_double = ParagraphStyle("ApptBodyDoubleJ", parent=justified, leading=22.0)
 
     story = list(build_pdf_letterhead(college_key, styles, page_width))
 
@@ -958,53 +1035,79 @@ def build_appointment_letter_story(college_key, rec, details, exam_month_year, s
     for line in build_address_lines(rec["examiner_name"], details):
         if line and line.strip():
             story.append(Paragraph(_esc(line.strip()), base))
-    story.append(Spacer(1, gap))
+    story.append(Spacer(1, 24.0))
 
     # 3. Subject line
-    role = _esc(rec["role"])
+    role_raw = str(rec.get("role") or "").strip()
+    is_revaluator = "reval" in role_raw.lower()
+    role_label = (
+        "Examiner (Revaluation)"
+        if is_revaluator
+        else ("Moderator" if "mod" in role_raw.lower() else (role_raw.title() or "Moderator"))
+    )
+    role_in_body = "Examiner (Revaluation)" if is_revaluator else role_label.lower()
+    action_cap = "Revaluation" if is_revaluator else "Moderation"
+    action_low = action_cap.lower()
+
     exam_my_esc = _esc(exam_month_year)
+    program_esc = f"<b>{_esc(rec.get('course') or '')}</b>"
+    semester_esc = f"<b>{_esc(rec.get('semester') or '')}</b>"
+    acad_yr_raw = str(rec.get("academic_year") or "").strip()
+    acad_yr_part = f" <b>({_esc(acad_yr_raw)})</b>" if acad_yr_raw else ""
+    subject_esc = f"<b>{_esc(rec.get('subject') or '')}</b>"
+    college_esc = _esc(COLLEGE_CONFIGS[college_key]["short_name"])
+    present_cnt = parse_int_count(rec.get("present_clubbed", rec.get("present", rec.get("checked", 0))))
+    present_cnt_bold = f"<b>{present_cnt}</b>"
+
     story.append(Paragraph(
-        f"Sub: Appointment as Examiner ({role}) for End Semester Examination, {exam_my_esc}",
+        f"Sub: Appointment as {_esc(role_label)} for End Semester Examination, {exam_my_esc}",
         s["bold_centre"],
     ))
+    story.append(Spacer(1, 24.0))
+
+    # 4. Salutation & body (body paragraphs use 2.0 line spacing)
+    story.append(Paragraph(f"Dear {_esc(rec['salutation'])},", body_double))
     story.append(Spacer(1, gap))
 
-    # 4. Salutation & body
-    story.append(Paragraph(f"Dear {_esc(rec['salutation'])},", justified))
+    para1 = (
+        f"We are pleased to appoint you as {_esc(role_in_body)} for the End Semester Examination "
+        f"of the {program_esc}, {semester_esc}{acad_yr_part} for the subject {subject_esc} "
+        f"at {college_esc}."
+    )
+    story.append(Paragraph(para1, body_double))
+    story.append(Spacer(1, gap))
+
+    if not is_revaluator:
+        para2 = (
+            f"The answer books have already been assessed and are required to be moderated in "
+            f"accordance with the examination guidelines of the College. "
+            f"{_esc(action_cap)} of {present_cnt_bold} answer books is required to be done as per the rules."
+        )
+    else:
+        para2 = (
+            f"{_esc(action_cap)} of {present_cnt_bold} answer books is required to be done as per the rules."
+        )
+    story.append(Paragraph(para2, body_double))
     story.append(Spacer(1, gap))
 
     story.append(Paragraph(
-        f"We are pleased to appoint you as Examiner ({role}) for the End Semester "
-        f"Examination held in {exam_my_esc}.",
-        justified,
-    ))
-    story.append(Spacer(1, gap))
-
-    # Program / Semester / Academic Year / Subject - tight block
-    story.append(Paragraph(f"<b>Program:</b> {_esc(rec['course'])}", indented_justified))
-    story.append(Paragraph(f"<b>Semester:</b> {_esc(rec['semester'])}", indented_justified))
-    story.append(Paragraph(f"<b>Academic Year:</b> {_esc(rec['academic_year'])}", indented_justified))
-    story.append(Paragraph(f"<b>Subject:</b> {_esc(rec['subject'])}", indented_justified))
-    story.append(Spacer(1, gap))
-
-    story.append(Paragraph(
-        "The Evaluation is in online mode (Onscreen Marking) for which you will receive an "
-        "email after assignment of the evaluation task.",
-        justified,
+        f"The {_esc(action_low)} will be in online mode (Onscreen Marking) for which you will "
+        f"receive an email containing the access details upon assignment of the {_esc(action_low)} task.",
+        body_double,
     ))
     story.append(Spacer(1, gap))
 
     story.append(Paragraph(
-        "An honorarium, as per the rules will be paid towards the assessment.",
-        justified,
+        f"An honorarium, as per the rules will be paid towards the {_esc(action_low)}.",
+        body_double,
     ))
     story.append(Spacer(1, gap))
 
-    story.append(Paragraph("Thank you.", justified))
+    story.append(Paragraph("Thank you.", body_double))
     story.append(Spacer(1, gap))
 
     # 5. Signature block
-    story.append(_build_signature_block(styles, page_width, container_inset))
+    story.extend(_build_signature_block(styles, page_width, container_inset))
     return story
 
 
@@ -1042,7 +1145,7 @@ def build_thanking_letter_story(
     for line in build_address_lines(first_rec["examiner_name"], details):
         if line and line.strip():
             story.append(Paragraph(_esc(line.strip()), base))
-    story.append(Spacer(1, gap))
+    story.append(Spacer(1, 24.0))
 
     # 3. Salutation & opening paragraphs
     roles_txt = " / ".join(dict.fromkeys(r["role"] for r in records))
@@ -1090,45 +1193,95 @@ def build_thanking_letter_story(
         Paragraph("<b>" + "<br/>".join(lines) + "</b>", th_style) for lines in header_lines
     ]]
     for r in records:
+        ans_cnt = parse_int_count(r.get("present_clubbed", r.get("present", r.get("checked", 0))))
         table_data.append([
             Paragraph(_esc(r["course"]), td_left),
             Paragraph(_esc(semester_roman_only(r["semester"])), td_center),
             Paragraph(_esc(r["subject"]), td_left),
-            Paragraph(str(r.get("checked", 0)), td_center),
+            Paragraph(str(ans_cnt), td_center),
         ])
 
     tbl_width = page_width - 2 * container_inset
-    cell_pad = 5 + 5
-    min_widths = [
+    pad_lr = 0.1 * cm
+    pad_tb = 0.05 * cm
+    cell_pad = 2 * pad_lr
+    # Reduce Semester width and transfer that width to Subject column
+    sem_min_w = max(stringWidth("Semester", "Times-Bold", tbl_font_size) + cell_pad + 4, 0.52 * inch)
+    other_mins = [
         max(stringWidth(line, "Times-Bold", tbl_font_size) for line in lines) + cell_pad + 6
-        for lines in header_lines
+        for idx, lines in enumerate(header_lines) if idx != 1
     ]
+    min_widths = [other_mins[0], sem_min_w, other_mins[1], other_mins[2]]
     col_widths = [
-        max(tbl_width * pct, mn) for pct, mn in zip((0.38, 0.12, 0.32, 0.16), min_widths)
+        max(tbl_width * pct, mn) for pct, mn in zip((0.37, 0.08, 0.39, 0.16), min_widths)
     ]
+    # Transfer any width above sem_min_w from Semester (col 1) to Subject (col 2)
+    if col_widths[1] > sem_min_w:
+        shift_w = col_widths[1] - sem_min_w
+        col_widths[1] = sem_min_w
+        col_widths[2] += shift_w
+
     excess = sum(col_widths) - tbl_width
-    if excess > 0:   # take the surplus from the wide text columns (Program, Subject)
+    if excess > 0:   # take the surplus from Program and Subject (keep Semester compact)
         flex_total = col_widths[0] + col_widths[2]
         col_widths[0] -= excess * col_widths[0] / flex_total
         col_widths[2] -= excess * col_widths[2] / flex_total
+    elif excess < 0:  # distribute any remaining slack proportionally so table width matches body width exactly
+        flex_total = col_widths[0] + col_widths[2]
+        col_widths[0] += (-excess) * col_widths[0] / flex_total
+        col_widths[2] += (-excess) * col_widths[2] / flex_total
 
-    subj_table = Table(table_data, colWidths=col_widths, repeatRows=1)
+    # Compute uniform/equal row height across all rows in the Thanking Letter table
+    max_lines_per_row = [1, 2]  # header has 2 lines in "No. of / Answer books"
+    for r in records:
+        row_texts = [
+            (str(r.get("course") or ""), col_widths[0]),
+            (semester_roman_only(r.get("semester") or ""), col_widths[1]),
+            (str(r.get("subject") or ""), col_widths[2]),
+            (str(parse_int_count(r.get("present_clubbed", r.get("present", r.get("checked", 0))))), col_widths[3]),
+        ]
+        line_counts = []
+        for txt, cw in row_texts:
+            avail_w = max(cw - cell_pad, 10.0)
+            words = txt.split()
+            if not words:
+                line_counts.append(1)
+                continue
+            lines_cnt = 1
+            cur = ""
+            for w in words:
+                cand = f"{cur} {w}".strip()
+                if stringWidth(cand, "Times-Roman", tbl_font_size) <= avail_w:
+                    cur = cand
+                else:
+                    lines_cnt += 1
+                    cur = w
+            line_counts.append(lines_cnt)
+        max_lines_per_row.append(max(line_counts))
+
+    max_lines = max(max_lines_per_row) if max_lines_per_row else 1
+    equal_row_h = max_lines * tbl_leading + 2 * pad_tb + 2.0
+    row_heights = [equal_row_h] * len(table_data)
+
+    subj_table = Table(table_data, colWidths=col_widths, rowHeights=row_heights, repeatRows=1, hAlign="LEFT")
     subj_table.setStyle(TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F2F2")),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), tbl_pad),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), tbl_pad),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), pad_tb),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), pad_tb),
+        ("LEFTPADDING", (0, 0), (-1, -1), pad_lr),
+        ("RIGHTPADDING", (0, 0), (-1, -1), pad_lr),
     ]))
 
-    wrapper_table = Table([[subj_table]], colWidths=[page_width])
+    wrapper_table = Table([[subj_table]], colWidths=[page_width], hAlign="LEFT")
     wrapper_table.setStyle(TableStyle([
         ("LEFTPADDING", (0, 0), (-1, -1), container_inset),
         ("RIGHTPADDING", (0, 0), (-1, -1), container_inset),
         ("TOPPADDING", (0, 0), (-1, -1), 0),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+        ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
     ]))
     story.append(wrapper_table)
     story.append(Spacer(1, gap))
@@ -1146,7 +1299,7 @@ def build_thanking_letter_story(
     story.append(Spacer(1, gap))
 
     # 6. Signature block
-    story.append(_build_signature_block(styles, page_width, container_inset))
+    story.extend(_build_signature_block(styles, page_width, container_inset))
 
     # Guarantee everything stays on a single page even for 12+ rows
     kif = KeepInFrame(page_width - 12, page_height - 12, story, mode="shrink")
@@ -1194,7 +1347,7 @@ def generate_letter_pdf(
     page_height = A4[1] - 2 * margin
     styles = getSampleStyleSheet()
 
-    records = sort_by_assigned(records)   # ascending Assigned Date everywhere
+    records = club_duplicate_records(records)   # club matching assignments & sort by Assigned Date
 
     story = []
     if letter_type in ("Appointment Letter", "All Letters"):
@@ -1339,7 +1492,7 @@ def show():
 
     st.caption(
         f"**{college_cfg['code']} Format Active** • Loaded **{len(recs)}** rows • "
-        f"**{len(eligible)}** Moderator/Revaluator assignments across **{len(ex_keys)}** examiners."
+        f"**{len(eligible)}** Moderator / Examiner (Revaluation) assignments across **{len(ex_keys)}** examiners."
     )
 
     # ------------------------------------------------------------------
@@ -1354,12 +1507,14 @@ def show():
             format_func=lambda k: f"{name_of[k]} ({counts[k]} subject{'s' if counts[k] > 1 else ''})",
             key="sel_examiner",
         )
-        ex_rows = eligible[eligible["examiner_key"] == sel_key].reset_index(drop=True)
+        ex_rows_raw = eligible[eligible["examiner_key"] == sel_key].to_dict("records")
+        ex_rows = pd.DataFrame(club_duplicate_records(ex_rows_raw)).reset_index(drop=True)
 
         def subj_label(i):
             r = ex_rows.iloc[i]
             status = "✅" if r["complete"] else "⏳"
-            return f"{status} {r['role']} | {r['semester']} | {r['subject']} ({r['course']}) — Checked: {r['checked']}"
+            p_cnt = parse_int_count(r.get("present_clubbed", r.get("present", r.get("checked", 0))))
+            return f"{status} {r['role']} | {r['semester']} | {r['subject']} ({r['course']}) — Present: {p_cnt}"
 
         chosen_idx = st.multiselect(
             "Subjects to include   (✅ evaluation completed · ⏳ pending)",
@@ -1507,6 +1662,9 @@ def show():
             "semester": r["semester"],
             "subject": r["subject"],
             "academic_year": ay_override or r["academic_year"],
+            "exam_dt": _to_dt(r.get("exam_dt")),
+            "present": parse_int_count(r.get("present", r.get("checked", 0))),
+            "present_clubbed": parse_int_count(r.get("present_clubbed", r.get("present", r.get("checked", 0)))),
             "checked": r["checked"],
             "complete": bool(r["complete"]),
             "pending_reason": r["pending_reason"],
@@ -1533,7 +1691,7 @@ def show():
         )
         preview_df = preview_df[
             ["date_text", "thank_date_text", "examiner_name", "role", "course", "semester",
-             "subject", "checked", "status"]
+             "subject", "present_clubbed", "checked", "status"]
         ].rename(columns={
             "date_text": "Appt. Date",
             "thank_date_text": "Thanking Date",
@@ -1542,7 +1700,8 @@ def show():
             "course": "Program",
             "semester": "Semester",
             "subject": "Subject",
-            "checked": "No. of Answer books",
+            "present_clubbed": "Present (Clubbed)",
+            "checked": "Checked",
             "status": "Evaluation Status",
         })
         st.dataframe(preview_df, use_container_width=True, hide_index=True)
