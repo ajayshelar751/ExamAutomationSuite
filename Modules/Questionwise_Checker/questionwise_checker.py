@@ -223,9 +223,12 @@ SAP_NO_CHANGE_FILL = "BDD7EE"                         # pastel blue
 # ==================================================
 def parse_question_column_info(col_name):
     """
-    Parses a question column header such as:
-      - "1) Q1.a (5.00)"
-      - "Q1 (10)", "Q.1A (5)", "Q.1.A", "Q.1a", "Q.1.a", "Q.1.I", "Q.1.i"
+    Parses a question column header across variations such as:
+      - "1) Q1.a (5.00)", "Q1 (10)", "Q.1A (5)", "Q.1.A", "Q.1a", "Q.1.a", "Q.1.I", "Q.1.i"
+      - "Q1A", "Q1B", "Q1C", "Q1.1", "Q1.2", "Q1.3", "Q1 1", "Q1 2", "Q1 3"
+      - "Q1 A", "Q1 B", "Q1 C", "Q1a", "Q1b", "Q1c", "Q1 a", "Q1 b", "Q1 c"
+      - "Q1 i", "Q1 ii", "Q1 iii", "Q1i", "Q1ii", "Q1iii"
+      - Compound sub-parts like "1) Q1A.i (10.00)", "2) Q1B.i (10.00)", "7) Q4A (5.00)"
     Returns dict with col, main_q, sub_part, max_marks, or None if not a question column.
     """
     s = str(col_name).strip()
@@ -236,16 +239,23 @@ def parse_question_column_info(col_name):
     s_body = re.sub(r"^\d+\s*[\)\.]\s*", "", s_body).strip()
 
     m_q = re.match(
-        r"^Q\s*\.?\s*(\d+)(?:(?:\s*\.\s*|\s*)([A-Za-z]+|[IVXLCDMivxlcdm]+))?$",
+        r"^Q\s*\.?\s*(\d+)(?:(?:\s*\.\s*|\s*|-)?([A-Za-z]+|[IVXLCDMivxlcdm]+|\d+))?(?:(?:\s*\.\s*|\s*|-)?([A-Za-z]+|[IVXLCDMivxlcdm]+|\d+))?$",
         s_body,
     )
     if not m_q:
         return None
 
+    part1 = m_q.group(2)
+    part2 = m_q.group(3)
+    if part1 and part2:
+        sub_part = f"{part1}.{part2}"
+    else:
+        sub_part = part1 or part2
+
     return {
         "col": col_name,
         "main_q": f"Q{int(m_q.group(1))}",
-        "sub_part": m_q.group(2),
+        "sub_part": sub_part,
         "max_marks": max_marks,
     }
 
@@ -295,20 +305,44 @@ def infer_subquestion_best_k_map(df, question_columns):
             best_k_map[main_q] = max(1, min(k_inf, n_subs))
             continue
 
-        if n_subs >= 3 and len(sub_maxes) == n_subs and len(set(sub_maxes)) == 1:
+        if n_subs >= 2 and len(sub_maxes) == n_subs and len(set(sub_maxes)) == 1:
             ambiguous_groups[main_q] = [x["col"] for x in sub_items]
-            best_k_map[main_q] = n_subs - 1
+            best_k_map[main_q] = max(1, n_subs - 1)
             continue
 
         best_k_map[main_q] = n_subs
 
     if ambiguous_groups and "TotalObtainedScore" in df.columns:
-        other_fixed_cols = {
-            mq: [x["col"] for x in items]
-            for mq, items in groups.items()
-            if mq not in ambiguous_groups
-        }
-        other_fixed_k = {mq: best_k_map[mq] for mq in other_fixed_cols}
+        max_n_subs = max(len(c) for c in ambiguous_groups.values())
+        best_uniform_k = None
+        best_uniform_matches = -1
+
+        for u_k in range(1, max_n_subs + 1):
+            matches = 0
+            evaluated = 0
+            for _, row in df.iterrows():
+                tot = _parse_numeric_mark(row.get("TotalObtainedScore"))
+                if tot is None:
+                    continue
+                evaluated += 1
+                subtotal = 0.0
+                for mq, items in groups.items():
+                    q_cols = [x["col"] for x in items]
+                    vals = sorted(
+                        [v for v in (_parse_numeric_mark(row.get(c)) for c in q_cols) if v is not None],
+                        reverse=True,
+                    )
+                    k_use = min(u_k, len(vals)) if mq in ambiguous_groups else best_k_map[mq]
+                    subtotal += sum(vals[:k_use])
+                if abs(subtotal - tot) <= 0.5001:
+                    matches += 1
+            if evaluated > 0 and matches > best_uniform_matches:
+                best_uniform_matches = matches
+                best_uniform_k = u_k
+
+        if best_uniform_k is not None and best_uniform_matches > 0:
+            for mq, q_cols in ambiguous_groups.items():
+                best_k_map[mq] = min(best_uniform_k, len(q_cols))
 
         for mq, q_cols in ambiguous_groups.items():
             n_subs = len(q_cols)
@@ -353,6 +387,86 @@ def _fmt_num_clean(num):
     """Formats numeric mark cleanly without trailing .0 when whole."""
     r = round(float(num), 2)
     return str(int(r)) if float(r).is_integer() else f"{r:g}"
+
+
+def predict_semester_total_max_marks(df, question_columns=None, best_k_map=None):
+    """
+    Predicts subject-wide Semester Total Max Marks from non-excluded question
+    bracket max values (e.g. (5.00)) when VGMR is not provided.
+    Returns float total or None if no bracket max values are found.
+    """
+    q_cols = (
+        question_columns
+        if question_columns is not None
+        else [c for c in df.columns if c not in FIXED_COLUMNS]
+    )
+    if not q_cols:
+        return None
+    if best_k_map is None:
+        best_k_map = infer_subquestion_best_k_map(df, q_cols)
+
+    groups = {}
+    ungrouped = []
+    for col in q_cols:
+        info = parse_question_column_info(col)
+        if info is not None:
+            groups.setdefault(info["main_q"], []).append(info)
+        else:
+            ungrouped.append(col)
+
+    total = 0.0
+    found_any = False
+
+    for col in ungrouped:
+        m = re.search(r"[\(\[]\s*([\d.]+)\s*[\)\]]\s*$", str(col))
+        if m:
+            total += float(m.group(1))
+            found_any = True
+
+    for main_q, items in groups.items():
+        sub_items = [x for x in items if x["sub_part"] and x["max_marks"] is not None and x["max_marks"] > 0]
+        main_items = [x for x in items if not x["sub_part"] and x["max_marks"] is not None and x["max_marks"] > 0]
+
+        if sub_items:
+            k = min(best_k_map.get(main_q, len(sub_items)), len(sub_items))
+            top_sub_maxes = sorted([x["max_marks"] for x in sub_items], reverse=True)[:k]
+            total += sum(top_sub_maxes)
+            found_any = True
+        elif main_items:
+            total += sum(x["max_marks"] for x in main_items)
+            found_any = True
+
+    return round(total, 2) if found_any else None
+
+
+def apply_predicted_semester_total_max_marks(df, question_columns=None):
+    """
+    When VGMR is not provided (or Semester Total Max Marks is blank on rows),
+    fills a single subject-wide predicted value formatted with '!' on both
+    sides (e.g., '!30!') across all rows in Semester Total Max Marks.
+    """
+    df = df.copy()
+    if "Semester Total Max Marks" not in df.columns:
+        return df
+
+    q_cols = (
+        question_columns
+        if question_columns is not None
+        else [c for c in df.columns if c not in FIXED_COLUMNS]
+    )
+    predicted = predict_semester_total_max_marks(df, q_cols)
+    if predicted is None:
+        return df
+
+    pred_str = f"!{_fmt_num_clean(predicted)}!"
+    existing_non_empty = df["Semester Total Max Marks"].astype(str).str.strip().replace("", pd.NA).dropna()
+    if existing_non_empty.empty:
+        df["Semester Total Max Marks"] = pred_str
+    else:
+        mask_blank = df["Semester Total Max Marks"].astype(str).str.strip() == ""
+        df.loc[mask_blank, "Semester Total Max Marks"] = pred_str
+
+    return df
 
 
 def compute_row_excluded_extra_marks(row, df, question_columns, best_k_map=None):
@@ -407,21 +521,27 @@ def compute_row_excluded_extra_marks(row, df, question_columns, best_k_map=None)
             excluded_cols.add(ex_col)
         total_extra += sum(val for val, _ in scored_sorted[k:])
 
-    # Non-excluded total is less by 0.5 than TotalObtainedScore -> rounded up to nearest greater number
-    is_half_round_up = (tot > counted_sum) and (abs((tot - counted_sum) - 0.5) <= 1e-6)
-    if is_half_round_up and total_extra <= 1e-9:
-        return "(0.5)", excluded_cols, counted_sum, True
-
-    # Ignore standalone 0.5 rounding differences
-    if abs(total_extra - 0.5) <= 1e-6:
-        return "", set(), counted_sum, is_half_round_up
+    # Check fractional rounding between counted_sum and TotalObtainedScore:
+    # - Rounded up (e.g., 18.75 -> 19 diff +0.25, or 18.5 -> 19 diff +0.5): valid rounding, not an error.
+    # - Rounded down (e.g., 18.25 -> 18 diff -0.25): valid rounding (<0.5 dropped), not an error.
+    diff_tot_counted = round(tot - counted_sum, 4)
+    is_round_up = (diff_tot_counted > 0) and (diff_tot_counted <= 0.5 + 1e-6) and (abs((diff_tot_counted * 4) - round(diff_tot_counted * 4)) <= 1e-4)
+    is_round_down = (diff_tot_counted < 0) and (abs(diff_tot_counted) < 0.5 - 1e-6) and (abs((abs(diff_tot_counted) * 4) - round(abs(diff_tot_counted) * 4)) <= 1e-4)
+    is_valid_rounding = is_round_up or is_round_down
 
     if total_extra <= 1e-9:
-        return "", excluded_cols, counted_sum, is_half_round_up
+        if is_round_up:
+            return f"({_fmt_num_clean(diff_tot_counted)})", excluded_cols, counted_sum, True
+        if is_round_down:
+            return f"({_fmt_num_clean(abs(diff_tot_counted))})", excluded_cols, counted_sum, True
+        return "", excluded_cols, counted_sum, False
+
+    if abs(total_extra - 0.5) <= 1e-6:
+        return "", set(), counted_sum, is_valid_rounding
 
     rounded = round(total_extra, 2)
     val_out = int(rounded) if float(rounded).is_integer() else rounded
-    return val_out, excluded_cols, counted_sum, is_half_round_up
+    return val_out, excluded_cols, counted_sum, is_valid_rounding
 
 
 def add_excluded_extra_marks_column(df, question_columns=None):
@@ -770,7 +890,7 @@ def calculate_moderator_change_pct(df):
             # Denominator selection, in priority order:
             # 1. Try Semester Total Max Marks from GMR lookup (most accurate, whole-semester scale).
             sem_max_marks = 0.0
-            sem_max_val = str(moderator_row.get("Semester Total Max Marks", "")).strip()
+            sem_max_val = str(moderator_row.get("Semester Total Max Marks", "")).strip().strip("!")
             if sem_max_val != "":
                 try:
                     sem_max_marks = float(sem_max_val)
@@ -1584,7 +1704,7 @@ def _apply_total_and_grade_validation(worksheet, download_df, cols):
             continue
 
         if can_check_total:
-            semester = _to_float_or_none(download_df.loc[row_idx, "Semester Marks"])
+            semester = _to_float_or_none(str(download_df.loc[row_idx, "Semester Marks"]).strip("!"))
             if semester is not None:
                 internal = _to_float_or_none(download_df.loc[row_idx, "Internal Marks"])
                 expected_total = semester + (internal or 0.0)
@@ -1759,13 +1879,13 @@ def _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font):
                 bottom=b.bottom,
             )
 
-    # 6a. Between main question groups (Q1.A..Q1.D | Q2.A..Q2.D | ...).
+    # 6a. Between main question groups (Q1 | Q2 | Q3 | ... across all numbering styles).
     groups = []   # list of [first_col_idx, last_col_idx]
     prev_key = None
     for q_col in question_cols:
         col_idx = cols.index(q_col) + 1
-        match = re.search(r"\bQ\s*(\d+)", q_col)
-        key = match.group(1) if match else q_col
+        q_info = parse_question_column_info(q_col)
+        key = q_info["main_q"] if q_info else q_col
         if groups and key == prev_key and col_idx == groups[-1][1] + 1:
             groups[-1][1] = col_idx
         else:
@@ -1842,6 +1962,16 @@ def _apply_enhanced_formatting(worksheet, download_df, cols, bright_green_font):
                         f"Total Obtained Score ({_fmt_num_clean(tot_num)}) != Non-Excluded Sub-Question Total ({_fmt_num_clean(counted_sum)}).",
                         "Questionwise Checker",
                     )
+
+    # 5e. Bold gray text on predicted Semester Total Max Marks (!number!).
+    if "Semester Total Max Marks" in cols:
+        sem_max_col_idx = cols.index("Semester Total Max Marks") + 1
+        gray_bold_font = Font(bold=True, color="7F7F7F")
+        for r_idx in range(2, worksheet.max_row + 1):
+            c = worksheet.cell(row=r_idx, column=sem_max_col_idx)
+            c_txt = str(c.value or "").strip()
+            if c_txt.startswith("!") and c_txt.endswith("!"):
+                c.font = gray_bold_font
 
     # 8. Rename the header labels last (all column lookups above use the original names).
     if "TotalObtainedScore" in cols:
@@ -1993,11 +2123,11 @@ def create_consolidated_multi_sheet_excel(dfs_list):
 
             fixed_10_cols = {
                 "Semester Total Max Marks", "Semester Marks", "Internal Marks",
-                "Total Max Marks", "Total Marks Obtained", "Grade", "Change %"
+                "Total Max Marks", "Total Marks Obtained", "Grade", "Change %", "Excluded Extra Marks"
             }
             align_center_col_names = {
                 "SrNo", "Subject code", "Grade", "Internal Marks", "Semester Marks",
-                "Total Max Marks", "Semester Total Max Marks", "Total Marks Obtained", "Change %"
+                "Total Max Marks", "Semester Total Max Marks", "Total Marks Obtained", "Change %", "Excluded Extra Marks"
             }
 
             center_col_indices = _center_column_indices(cols, align_center_col_names)
@@ -2107,15 +2237,16 @@ def show():
                 st.error(f"Missing required 'PRNNumber' or 'UserType' columns in {uploaded_file.name}.")
                 continue
 
-            # Apply GMR Lookup Match & Change % Calculation.
+            question_columns = [col for col in df.columns if col not in FIXED_COLUMNS]
+
+            # Apply GMR Lookup Match, Predicted Semester Total Max Marks (if needed), & Change % Calculation.
             df = apply_gmr_lookup(df, gmr_df)
+            df = apply_predicted_semester_total_max_marks(df, question_columns)
             df = calculate_moderator_change_pct(df)
             df = reorder_gmr_columns(df)
-            df = add_excluded_extra_marks_column(df)
+            df = add_excluded_extra_marks_column(df, question_columns)
 
             dfs_for_multi_sheet.append((df, uploaded_file.name))
-
-            question_columns = [col for col in df.columns if col not in FIXED_COLUMNS]
 
             # --- Summary statistics ---
             total_students = df["PRNNumber"].nunique()
@@ -2128,6 +2259,8 @@ def show():
             reval2_positive, reval2_negative, reval2_no_change = score_change_summary(df, "Reval 2")
 
             mod_cnt, cnt_gt_10, ratio_gt_10, is_eligible = compute_moderation_10pct_metrics(df)
+
+            st.subheader(build_paper_info(df))
 
             # --- 5 Summary Cards Grid ---
             col1, col2, col3, col4, col5 = st.columns(5)
@@ -2183,60 +2316,6 @@ def show():
             if is_eligible:
                 st.error("Above 10% change in marks is observed in more than 50% of the moderated answer books. This module is eligible for 100% Moderation.")
 
-            st.subheader(build_paper_info(df))
-
-            # --- Filter preview subsets ---
-            no_attendance_hidden_columns = PREVIEW_HIDDEN_COLUMNS + ["MarkAttendance"]
-
-            review_prns = df[
-                df["UserType"].astype(str).str.strip().isin(["Moderator", "Reval 1", "Reval 2"])
-            ]["PRNNumber"].unique()
-            review_df = df[df["PRNNumber"].isin(review_prns)].copy()
-
-            # Students where ANY reviewer's TotalObtainedScore actually differs from the Examiner's.
-            changed_prns = []
-            if "TotalObtainedScore" in df.columns and "UserType" in df.columns:
-                for prn, group in df.groupby("PRNNumber", dropna=False, sort=False):
-                    examiner_rows = group[group["UserType"] == "Examiner"]
-                    reviewer_rows = group[group["UserType"].isin(["Moderator", "Reval 1", "Reval 2"])]
-                    if not examiner_rows.empty and not reviewer_rows.empty:
-                        try:
-                            ex_score = float(examiner_rows.iloc[0]["TotalObtainedScore"])
-                            for _, rev_row in reviewer_rows.iterrows():
-                                rev_score = float(rev_row["TotalObtainedScore"])
-                                if rev_score != ex_score:
-                                    changed_prns.append(prn)
-                                    break  # One differing reviewer is enough to flag this student.
-                        except (TypeError, ValueError):
-                            continue  # Non-numeric score - can't determine "changed", skip this student.
-
-            changes_df = df[df["PRNNumber"].isin(changed_prns)].copy() if changed_prns else pd.DataFrame()
-
-            # --- Display Tabs ---
-            tab1, tab2, tab3 = st.tabs([
-                "📋 All Data Preview",
-                "🔍 Moderation / Revaluation Cases Only",
-                "⚡ Changes Only"
-            ])
-
-            with tab1:
-                st.subheader("All Data Preview")
-                st.write(style_preview(df, question_columns))
-
-            with tab2:
-                st.subheader("Moderation / Revaluation Cases Only")
-                if not review_df.empty:
-                    st.write(style_preview(review_df, question_columns, hide_columns=no_attendance_hidden_columns))
-                else:
-                    st.info("No moderation or revaluation cases found in this file.")
-
-            with tab3:
-                st.subheader("Changes Only")
-                if not changes_df.empty:
-                    st.write(style_preview(changes_df, question_columns, hide_columns=no_attendance_hidden_columns))
-                else:
-                    st.info("No score changes detected between examiner and reviewers.")
-
             # --- Generate individual Excel Outputs ---
             out_bytes_clean = to_excel_bytes(df)
             out_bytes_fmt = to_excel_bytes_formatted(df)
@@ -2282,7 +2361,7 @@ def show():
             zip_bytes = create_zip_file(processed_outputs_clean)
 
             st.download_button(
-                label="📦 Download All Output Excel Files (ZIP)",
+                label="📦 Download Question wise Excels for College (ZIP)",
                 data=zip_bytes,
                 file_name=zip_filename,
                 mime="application/zip",
@@ -2311,87 +2390,100 @@ def show():
 def render_help_section():
     """
     Renders a collapsible 'Tool Description / Help' section at the bottom of
-    the page in simple language with a detailed color and symbol guide.
+    the page in simple language with full color, border, and symbol details.
     """
     with st.expander("ℹ️ Tool Description / Help - click to expand", expanded=False):
         st.markdown(
             """
 ### What This Tool Does (In Simple Words)
-The **Questionwise Checker** helps examination staff check question-wise mark sheets, match
-them with the **VGMR** file (if uploaded), spot extra sub-question marks that were not counted
-in the total, check for mark mismatches, and download clean or formatted Excel files.
+The **Questionwise Checker** helps exam staff process question-wise mark sheets, match
+them with the **VGMR** file (when provided), predict `Semester Total Max Marks` when VGMR is not
+uploaded, identify extra sub-question marks that were not counted in the total, flag genuine
+score mismatches with explanatory comments, and generate clean or formatted Excel files.
 
 ---
-### Step-by-Step How It Works
-1. **Upload Files**: Upload one or more **Questionwise Excel** files (password-protected or open).
-   You can also upload one **VGMR Excel** file to fetch Internal Marks, Max Marks, Semester Marks,
-   and Grades.
-2. **Cleaning & Ordering**: Blank rows and `Count:` footer rows are removed. Each student's rows are
-   arranged in order: **Examiner → Moderator → Reval 1 → Reval 2**.
-3. **Sub-Question Best-Of Logic & Excluded Extra Marks**:
-   - Sub-questions (like `Q1.a`, `Q1.b`, `Q1.c`, or `Q.1.A`, `Q.1.I`, `Q.1.i`) are grouped under
-     their main question (`Q1`, `Q2`, `Q3`, etc.).
-   - The tool automatically finds how many sub-questions count per main question (`best_k`), keeps
-     the highest marks, and treats smaller extra attempted marks as **excluded extra marks**.
-   - Excluded sub-question cells are shown in curly brackets such as `{2.00}` (keeping the original
-     number format from your Excel sheet).
-   - **Half-mark (`0.5`) rounding**: If the non-excluded (counted) total is `0.5` less than
-     `TotalObtainedScore` because the total was rounded up to the next higher mark, it is **not**
-     treated as an error and is shown as `(0.5)` in **Excluded Extra Marks**.
-   - **Mismatch Error**: If the non-excluded total does not equal `TotalObtainedScore` (outside a
-     `0.5` upward rounding), `Total Obtained Score` is highlighted as an error and a short note
-     (Excel cell comment) explains why.
-4. **Preview & Download**:
-   - **All Data Preview**: Mimics the formatted Excel appearance right on screen.
-   - **Moderation / Revaluation Cases Only**: Shows students who have Moderator or Revaluation rows.
-   - **Changes Only**: Shows students whose score changed between Examiner and reviewers.
-   - **Downloads**: Download individual **Cleaned** or **Formatted** Excel files, a **ZIP** of
-     cleaned files, or a **Consolidated Multi-Sheet Excel** when multiple files are uploaded.
+### How Processing Works
+1. **Upload Questionwise & Optional VGMR Excel Files**: Upload one or more Questionwise Excel
+   files (protected or unprotected) and optionally one VGMR Excel file.
+2. **Cleaning & Ordering**: Blank rows and `Count:` footer rows are removed. Rows per student are
+   sorted as **Examiner → Moderator → Reval 1 → Reval 2**.
+3. **Predicted `Semester Total Max Marks` (When VGMR Is Not Provided)**:
+   - If VGMR is not uploaded (or `Semester Total Max Marks` is empty), the tool infers a single
+     subject-wide `Semester Total Max Marks` from the non-excluded question bracket marks (for
+     example, `2 × 5 + 2 × 5 + 2 × 5 = 30`).
+   - That predicted value is written identically across all rows of the subject with `!` on both
+     sides (e.g., `!30!`) in **bold gray text**.
+4. **Sub-Question Grouping, Best-Of Selection & Excluded Extra Marks**:
+   - Sub-questions across formats such as `Q1.a`, `Q1.b`, `Q1.c`, `Q.1.A`, `Q.1.I`, `Q.1.i`,
+     `Q1A`, `Q1.1`, `Q1 1`, `Q1 A`, `Q1a`, `Q1 a`, `Q1 i`, `Q1i` are grouped under their main
+     question (`Q1`, `Q2`, `Q3`, …).
+   - The tool automatically determines `best_k` counted sub-questions per main question group,
+     keeps the highest marks, and treats smaller extra attempted marks as **excluded extra marks**.
+   - Excluded sub-question cells are shown in curly brackets `{...}` keeping their original number
+     format from Excel (for example, `{2.00}` or `{4.00}`).
+5. **Half-Mark / Quarter-Mark Rounding (`0.25` / `0.5`) vs. Error Highlighting**:
+   - **Round down (`< 0.5`, e.g., `18.25` → `18`)**: Treated as normal rounding (not an error), and
+     shown as `(0.25)` in **Excluded Extra Marks** when there are no other extra sub-question marks.
+   - **Round up (`0.25` or `0.5`, e.g., `18.75` → `19` or `18.5` → `19`)**: Treated as normal rounding
+     (not an error), and shown as `(0.25)` or `(0.5)` in **Excluded Extra Marks** when there are no
+     other extra sub-question marks.
+   - **Mismatch Error**: If the non-excluded (counted) total does not equal `TotalObtainedScore`
+     outside these rounding cases, `Total Obtained Score` is highlighted as an error and a short
+     explanatory note (cell comment) is added in Excel.
+6. **Downloads**:
+   - **Download Cleaned File** & **Download Question wise Excels for College (ZIP)**: Standard/clean
+     exports without formatted styling.
+   - **Download Formatted File** & **Download Consolidated Multi-Sheet Excel**: Full formatted Excel
+     workbooks containing all user types, GMR columns, `Change %`, `Excluded Extra Marks`, colors,
+     borders, and error comments.
 
 ---
-### Detailed Guide to All Colors, Fonts & Symbols
+### Complete Guide to Colors, Fonts, Borders & Symbols
 
-#### 1. Error & Mismatch Highlights (Red Fill with Bold Yellow Text + Explanatory Note in Excel)
-- **Red background (`#FF0000`) + Bold Yellow text (`#FFFF00`)**: Marks a validation or total mismatch:
-  - **Total Obtained Score**: Counted (non-excluded) question marks do not match `TotalObtainedScore`
-    (except when `TotalObtainedScore` is higher by `0.5` due to upward rounding).
-  - **Semester Marks**: `Semester Marks` from VGMR does not match that row's `TotalObtainedScore`.
+#### 1. Error & Mismatch Highlights (Red Fill + Bold Yellow Font + Comment in Excel)
+- **Red background (`#FF0000`) + Bold Yellow text (`#FFFF00`)**: Highlights a genuine validation or
+  score mismatch on:
+  - **Total Obtained Score**: Non-excluded question total does not match `TotalObtainedScore`
+    (excluding valid `0.25` / `0.5` rounding cases).
+  - **Semester Marks**: VGMR `Semester Marks` does not match that row's `TotalObtainedScore`.
   - **Total Marks Obtained**: Does not equal `Semester Marks + Internal Marks`.
-  - **Grade**: Shown grade does not match the grade calculated from percentage marks.
-  - In exported Excel files, a **short comment** is added to these highlighted cells explaining the
-    exact mismatch.
+  - **Grade**: Displayed grade does not match the grade derived from percentage marks.
+  - Exported Excel files include a **short cell comment** explaining the mismatch.
 
-#### 2. Excluded Extra Sub-Question Marks (`{...}` and Blue Text)
-- **Curly brackets `{...}` + Bold Blue text (`#0000FF`)**: Marks a sub-question whose mark was **not**
-  included in the counted best-of total (for example, `{2.00}` or `{4.00}`).
-- **`(0.5)` in Excluded Extra Marks**: Indicates a `0.5` upward rounding difference between the
-  non-excluded sub-question total and `TotalObtainedScore` (not an error).
+#### 2. Excluded Extra Sub-Question Marks & Rounding Indicators
+- **Curly brackets `{...}` + Bold Blue font (`#0000FF`)**: Marks a sub-question whose mark was **not**
+  counted in the best-of total (e.g., `{2.00}`), preserving the original number format.
+- **Parentheses `(0.25)` or `(0.5)` in Excluded Extra Marks**: Indicates a valid `0.25` or `0.5`
+  rounding difference between counted marks and `TotalObtainedScore` (not an error).
 
-#### 3. Reviewer vs. Examiner Score Changes (Green & Red Text)
-- **Bright Green text (`#00B050` in Excel / `#00E676` in preview)**: Reviewer's mark, total, grade, or
-  `Change %` is **higher/better** than the Examiner's (also used when Moderator enters marks where
-  Examiner had `NA`).
-- **Red/Orange-Red text (`#FF4500`)**: Reviewer's mark, total, grade, or `Change %` is **lower/worse**
-  than the Examiner's, or a mark given by the Examiner is missing (`NA` or blank) for the reviewer.
+#### 3. Predicted `Semester Total Max Marks`
+- **Bold Gray font (`#7F7F7F`) with `!` on both sides (e.g., `!30!`)**: Shows the predicted
+  `Semester Total Max Marks` when VGMR is not provided.
 
-#### 4. Row & SAP ID Colors in Formatted Excel & All Data Preview
+#### 4. Reviewer vs. Examiner Score Changes
+- **Bright Green bold font (`#00B050`)**: Reviewer mark, total, grade, or `Change %` is higher/better
+  than Examiner (or Moderator awarded marks where Examiner had `NA`).
+- **Red/Orange-Red bold font (`#FF4500`)**: Reviewer mark, total, grade, or `Change %` is lower/worse
+  than Examiner, or a mark given by Examiner is missing (`NA` or blank) for the reviewer.
+
+#### 5. Row, Question & SAP ID Colors in Formatted & Consolidated Excel
 - **Light Green row fill (`#E2EFDA`)**: **Moderator** rows.
-- **Tan / Olive-Brown row fill (`#948A54`)**: **Examiner-only** rows (students with no Moderator or
-  Revaluation row).
-- **Yellow question cell fill (`#FFFF00`) + Red SAP ID fill (`#FF0000`)**: Moderator put `NA` or `0`
-  on a question where the Examiner awarded non-zero marks; SAP IDs of both Examiner and Moderator
-  rows are filled red to flag attention.
-- **SAP ID Color Scale (for students with both Examiner & Moderator rows)**:
+- **Tan / Olive-Brown row fill (`#948A54`)**: **Examiner-only** students (no Moderator or Reval row).
+- **Yellow question cell fill (`#FFFF00`) + Red SAP ID fill (`#FF0000`)**: Moderator entered `NA` or
+  `0` on a question where the Examiner awarded non-zero marks; SAP ID cells of both Examiner and
+  Moderator rows for that student are filled red.
+- **SAP ID Color Scale (students with both Examiner & Moderator rows)**:
   - **Pastel Green shades (`#C3E6C3`, `#8FD18F`, `#5DBB63`)**: Score **increased** from Examiner to
     Moderator (darker shade = larger `|Change %|`: up to 5%, 5%–10%, above 10%).
   - **Pastel Red shades (`#F8CBCB`, `#F19999`, `#E86A6A`)**: Score **decreased** from Examiner to
     Moderator (darker shade = larger `|Change %|`).
   - **Pastel Blue (`#BDD7EE`)**: **No change** between Examiner and Moderator score.
 
-#### 5. Header & Border Styling in Formatted Excel
-- **Soft Peach / Light Orange headers (`#FCE4D6`)**: GMR columns, `Change %`, and `Excluded Extra Marks`.
+#### 6. Headers & Borders in Formatted & Consolidated Excel
+- **Soft Peach / Light Orange headers (`#FCE4D6`)**: GMR columns, `Change %`, and
+  `Excluded Extra Marks`.
 - **Darker Grey header (`#999999`)**: `Total Obtained Score` header cell.
-- **Medium horizontal border**: Separates each student's group of rows.
+- **Medium horizontal bottom border**: Separates each student's row block.
 - **Thick vertical borders**: Separate main question groups (`Q1`, `Q2`, `Q3`, …) and frame
   `Total Obtained Score`.
             """
