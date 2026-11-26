@@ -13,3 +13,5 @@ plotly
 gdown
 pdfplumber
 PyMuPDF
+python-calamine
+xlsxwriter

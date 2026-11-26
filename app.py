@@ -160,6 +160,14 @@ else:
     _cdg_import_error_message = None
 
 try:
+    from Modules.DigiLocker_Reconciliation.digilocker_reconciliation import show as digilocker_reconciliation
+except Exception as import_error:
+    digilocker_reconciliation = None
+    _dlr_import_error_message = str(import_error)
+else:
+    _dlr_import_error_message = None
+
+try:
     from Modules.Data_Analysis.data_analysis import show as data_analysis
 except Exception as import_error:
     data_analysis = None
@@ -223,6 +231,7 @@ tools_list = [
     "Result Gazette PDF to Excel",
     "Grade Sheet to Excel",
     "Convocation Data Generator",
+    "DigiLocker Reconciliation",
     "Duplicate Checker",
     "Result Analysis",
     "Data Analysis",
@@ -365,6 +374,11 @@ if st.session_state.selected_tool == "Dashboard":
             "name": "Convocation Data Generator",
             "icon": "convocation",
             "desc": "Process MKCL reports and Master Data to generate standardized convocation Excel reports.",
+        },
+        {
+            "name": "DigiLocker Reconciliation",
+            "icon": "digilocker",
+            "desc": "Reconcile raw SAP Data against DigiLocker Email Reference files, resolve duplicates, export pending SAP rows, and inspect student-wise coverage.",
         },
         {
             "name": "Duplicate Checker",
@@ -553,6 +567,19 @@ elif st.session_state.selected_tool == "Convocation Data Generator":
     else:
         st.title("Convocation Data Generator")
         st.error(f"`{_cdg_import_error_message}`")
+
+# 10b. DigiLocker Reconciliation
+elif st.session_state.selected_tool == "DigiLocker Reconciliation":
+    if digilocker_reconciliation is not None:
+        digilocker_reconciliation()
+    else:
+        st.title("DigiLocker Reconciliation")
+        st.error(
+            "This tool could not be loaded due to an import error:\n\n"
+            f"`{_dlr_import_error_message}`\n\n"
+            "Ensure that `Modules/DigiLocker_Reconciliation/digilocker_reconciliation.py` exists "
+            "and defines a `show()` entry point function."
+        )
 
 # 11. Duplicate Checker
 elif st.session_state.selected_tool == "Duplicate Checker":
