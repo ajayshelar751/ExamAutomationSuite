@@ -63,6 +63,7 @@ NUMERIC_COLUMNS: set[str] = {
     "tot_mrks",
     "tot_credit",
     "tot_credit_points",
+    "grand_tot_credit",
     "grand_tot_credit_points",
     "ncrf_level",
 }
@@ -121,6 +122,21 @@ MONTH_MAP: dict[str, tuple[int, str]] = {
     "december": (12, "DECEMBER"),
 }
 
+SHORT_MONTH_MAP: dict[int, str] = {
+    1: "JAN",
+    2: "FEB",
+    3: "MAR",
+    4: "APR",
+    5: "MAY",
+    6: "JUN",
+    7: "JUL",
+    8: "AUG",
+    9: "SEP",
+    10: "OCT",
+    11: "NOV",
+    12: "DEC",
+}
+
 ROMAN_NUMERALS: dict[int, str] = {
     1: "I",
     2: "II",
@@ -167,6 +183,8 @@ _ABC_MISSING_PLACEHOLDERS: set[str] = {
 
 _WS_RE = re.compile(r"\s+")
 _PUNCT_RE = re.compile(r"[^\w\s]")
+_PARENS_OPEN_RE = re.compile(r"\s*\(\s*")
+_PARENS_CLOSE_RE = re.compile(r"\s*\)\s*")
 
 
 def clean_str(val: Any) -> str:
@@ -188,6 +206,23 @@ def norm_text(val: Any, case_insensitive: bool = True, strip_punctuation: bool =
         s = _PUNCT_RE.sub("", s)
     s = _WS_RE.sub(" ", s).strip()
     return s.upper() if case_insensitive else s
+
+
+def norm_course_name(val: Any) -> str:
+    """Normalize course_name casing and parenthesis spacing for matching/comparison only."""
+    s = norm_text(val, case_insensitive=True)
+    if not s:
+        return ""
+    s = _PARENS_OPEN_RE.sub(" (", s)
+    s = _PARENS_CLOSE_RE.sub(") ", s)
+    return _WS_RE.sub(" ", s).strip()
+
+
+def _natural_sort_key(val: str) -> tuple[tuple[tuple[int, int | str], ...], str]:
+    """Sort strings naturally so numeric segments sort numerically (e.g., 2 before 10)."""
+    parts = re.split(r"(\d+)", val)
+    tokens = tuple((0, int(p)) if p.isdigit() else (1, p) for p in parts if p)
+    return (tokens, val)
 
 
 def parse_month(val: Any) -> tuple[int, str]:
@@ -297,6 +332,8 @@ def validate_abc_id(val: Any) -> tuple[str, str]:
 
     Returns (status, cleaned_value) where status is one of:
       - 'VALID': exactly 12 numeric digits, not all identical (leading zeros preserved)
+      - 'FIXABLE_FORMAT': 12 digits separated by spaces or hyphens (e.g., '0224-0937-4403');
+                          cleaned_value is the stripped 12-digit string
       - 'MISSING': blank, null, or placeholder ('NA', 'N/A', '-')
       - 'DUMMY': '0', '000000000000', or 12 identical digits
       - 'INVALID_FORMAT': any other non-12-digit or non-numeric string
@@ -310,6 +347,13 @@ def validate_abc_id(val: Any) -> tuple[str, str]:
 
     if len(s) == 12 and s.isdigit() and len(set(s)) > 1:
         return ("VALID", s)
+
+    if re.fullmatch(r"[\d\s-]+", s):
+        digits_only = re.sub(r"[\s-]+", "", s)
+        if len(digits_only) == 12 and digits_only.isdigit():
+            if len(set(digits_only)) == 1:
+                return ("DUMMY", s)
+            return ("FIXABLE_FORMAT", digits_only)
 
     return ("INVALID_FORMAT", s)
 
@@ -329,12 +373,21 @@ def normalize_for_comparison(
     if not raw:
         return ""
 
+    if col_lower == "abc_account_id":
+        abc_status, abc_cleaned = validate_abc_id(raw)
+        if abc_status in ("VALID", "FIXABLE_FORMAT"):
+            return abc_cleaned
+        return norm_text(raw, case_insensitive=True) if normalize_text else raw
+
     if col_lower in PROTECTED_ID_COLUMNS:
         # Never run numeric normalization on protected IDs (preserves leading zeros)
         return norm_text(raw, case_insensitive=True) if normalize_text else raw
 
     if col_lower == "sem":
         return norm_sem_key(raw)
+
+    if col_lower == "course_name":
+        return norm_course_name(raw) if normalize_text else raw
 
     if normalize_months and col_lower in MONTH_COLUMNS:
         _, cname = parse_month(raw)
@@ -451,50 +504,131 @@ def _dedupe_headers(raw_headers: list[Any]) -> list[str]:
     return headers
 
 
-def _read_excel_calamine(source: str | Path | bytes, sheet_name: str | None = None) -> pd.DataFrame:
+def _concat_sheet_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate sheet DataFrames preserving column order and skipping empty trailing sheets."""
+    non_empty = [f for f in frames if not f.empty or len(f.columns) > 0]
+    if not non_empty:
+        return pd.DataFrame()
+    if len(non_empty) == 1:
+        return non_empty[0]
+
+    with_rows = [f for f in non_empty if not f.empty]
+    target = with_rows if with_rows else non_empty
+    ordered_cols: list[str] = []
+    seen: set[str] = set()
+    for f in target:
+        for c in f.columns:
+            if c not in seen:
+                seen.add(c)
+                ordered_cols.append(c)
+
+    combined = pd.concat(target, ignore_index=True).fillna("")
+    return combined[[c for c in ordered_cols if c in combined.columns]]
+
+
+def get_excel_sheet_names(source: str | Path | bytes, filename: str = "") -> list[str]:
+    """Return list of sheet names in an Excel file, or [] for CSV/non-Excel inputs."""
+    if filename and filename.lower().endswith(".csv"):
+        return []
+    if isinstance(source, (str, Path)) and str(source).lower().endswith(".csv"):
+        return []
+
+    if HAS_CALAMINE:
+        try:
+            if isinstance(source, (str, Path)):
+                wb = CalamineWorkbook.from_path(str(source))
+            else:
+                wb = CalamineWorkbook.from_filelike(io.BytesIO(source))
+            return list(wb.sheet_names)
+        except Exception:
+            pass
+
+    try:
+        if isinstance(source, (str, Path)):
+            wb = openpyxl.load_workbook(source, read_only=True, data_only=True)
+        else:
+            wb = openpyxl.load_workbook(io.BytesIO(source), read_only=True, data_only=True)
+        try:
+            return list(wb.sheetnames)
+        finally:
+            wb.close()
+    except Exception:
+        return []
+
+
+def _read_excel_calamine(
+    source: str | Path | bytes,
+    sheet_name: str | None = None,
+    read_all_sheets: bool = False,
+) -> pd.DataFrame:
     if isinstance(source, (str, Path)):
         wb = CalamineWorkbook.from_path(str(source))
     else:
         wb = CalamineWorkbook.from_filelike(io.BytesIO(source))
 
-    target_sheet = sheet_name if sheet_name and sheet_name in wb.sheet_names else wb.sheet_names[0]
-    rows = wb.get_sheet_by_name(target_sheet).to_python(skip_empty_area=False)
-    if not rows:
+    if not wb.sheet_names:
         return pd.DataFrame()
 
-    headers = _dedupe_headers(rows[0])
-    n_cols = len(headers)
-    data_rows: list[list[str]] = []
-    for row in rows[1:]:
-        padded = [_format_cell_as_str(row[i]) if i < len(row) else "" for i in range(n_cols)]
-        if any(cell != "" for cell in padded):
-            data_rows.append(padded)
+    if read_all_sheets:
+        target_sheets = list(wb.sheet_names)
+    else:
+        target_sheets = [
+            sheet_name if sheet_name and sheet_name in wb.sheet_names else wb.sheet_names[0]
+        ]
 
-    return pd.DataFrame(data_rows, columns=headers, dtype=str)
+    sheet_frames: list[pd.DataFrame] = []
+    for sname in target_sheets:
+        rows = wb.get_sheet_by_name(sname).to_python(skip_empty_area=False)
+        if not rows:
+            continue
+        headers = _dedupe_headers(rows[0])
+        n_cols = len(headers)
+        data_rows: list[list[str]] = []
+        for row in rows[1:]:
+            padded = [_format_cell_as_str(row[i]) if i < len(row) else "" for i in range(n_cols)]
+            if any(cell != "" for cell in padded):
+                data_rows.append(padded)
+        sheet_frames.append(pd.DataFrame(data_rows, columns=headers, dtype=str))
+
+    return _concat_sheet_frames(sheet_frames)
 
 
-def _read_excel_openpyxl(source: str | Path | bytes, sheet_name: str | None = None) -> pd.DataFrame:
+def _read_excel_openpyxl(
+    source: str | Path | bytes,
+    sheet_name: str | None = None,
+    read_all_sheets: bool = False,
+) -> pd.DataFrame:
     if isinstance(source, (str, Path)):
         wb = openpyxl.load_workbook(source, read_only=True, data_only=True)
     else:
         wb = openpyxl.load_workbook(io.BytesIO(source), read_only=True, data_only=True)
 
     try:
-        ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
-        it = ws.iter_rows(values_only=True)
-        try:
-            first_row = next(it)
-        except StopIteration:
-            return pd.DataFrame()
+        if read_all_sheets:
+            worksheets = [wb[s] for s in wb.sheetnames]
+        elif sheet_name and sheet_name in wb.sheetnames:
+            worksheets = [wb[sheet_name]]
+        else:
+            worksheets = [wb.active]
 
-        headers = _dedupe_headers(list(first_row))
-        n_cols = len(headers)
-        data_rows: list[list[str]] = []
-        for row in it:
-            padded = [_format_cell_as_str(row[i]) if i < len(row) else "" for i in range(n_cols)]
-            if any(cell != "" for cell in padded):
-                data_rows.append(padded)
-        return pd.DataFrame(data_rows, columns=headers, dtype=str)
+        sheet_frames: list[pd.DataFrame] = []
+        for ws in worksheets:
+            it = ws.iter_rows(values_only=True)
+            try:
+                first_row = next(it)
+            except StopIteration:
+                continue
+
+            headers = _dedupe_headers(list(first_row))
+            n_cols = len(headers)
+            data_rows: list[list[str]] = []
+            for row in it:
+                padded = [_format_cell_as_str(row[i]) if i < len(row) else "" for i in range(n_cols)]
+                if any(cell != "" for cell in padded):
+                    data_rows.append(padded)
+            sheet_frames.append(pd.DataFrame(data_rows, columns=headers, dtype=str))
+
+        return _concat_sheet_frames(sheet_frames)
     finally:
         wb.close()
 
@@ -537,6 +671,7 @@ def read_tabular_file(
     source: str | Path | bytes,
     filename: str,
     sheet_name: str | None = None,
+    read_all_sheets: bool = False,
 ) -> pd.DataFrame:
     """Load an .xlsx/.xlsm/.xls or .csv file into a string-typed DataFrame."""
     lower_name = filename.lower()
@@ -549,15 +684,18 @@ def read_tabular_file(
 
     if HAS_CALAMINE:
         try:
-            return _read_excel_calamine(source, sheet_name=sheet_name)
+            return _read_excel_calamine(
+                source, sheet_name=sheet_name, read_all_sheets=read_all_sheets
+            )
         except Exception:
             pass
-    return _read_excel_openpyxl(source, sheet_name=sheet_name)
+    return _read_excel_openpyxl(source, sheet_name=sheet_name, read_all_sheets=read_all_sheets)
 
 
 def load_uploaded_files(
     files: Iterable[tuple[str, str | Path | bytes]],
     sheet_name: str | None = None,
+    read_all_sheets: bool = False,
 ) -> LoadedDataset:
     """Load and concatenate one or more uploaded Excel/CSV files preserving all columns."""
     frames: list[pd.DataFrame] = []
@@ -567,7 +705,9 @@ def load_uploaded_files(
     seen_cols: set[str] = set()
 
     for fname, payload in files:
-        df = read_tabular_file(payload, filename=fname, sheet_name=sheet_name)
+        df = read_tabular_file(
+            payload, filename=fname, sheet_name=sheet_name, read_all_sheets=read_all_sheets
+        )
         df = df.copy()
         df["__uploaded_file__"] = fname
         df["__uploaded_row__"] = [str(i + 2) for i in range(len(df))]
@@ -616,25 +756,58 @@ def detect_file_role(norm_cols: set[str], col_count: int) -> str:
     return "UNKNOWN"
 
 
-def inspect_uploaded_batch(file_entries: tuple[tuple[str, bytes], ...]) -> dict[str, Any]:
-    """Inspect uploaded files for preflight stats, key presence, and file-swap detection."""
+def inspect_uploaded_batch(
+    file_entries: tuple[tuple[str, bytes], ...],
+    read_all_sheets: bool = False,
+) -> dict[str, Any]:
+    """Inspect uploaded files for preflight stats, multi-sheet Excel, collisions, and file swaps."""
     total_rows = 0
     max_cols = 0
     all_norm_cols: set[str] = set()
     swap_flags: list[tuple[str, str]] = []
     file_details: list[dict[str, Any]] = []
+    multi_sheet_files: list[dict[str, Any]] = []
+    courses_by_regn_sem: dict[tuple[str, str], set[str]] = {}
 
     for fname, raw_bytes in file_entries:
-        df = read_tabular_file(raw_bytes, filename=fname)
+        if not fname.lower().endswith(".csv"):
+            sheets = get_excel_sheet_names(raw_bytes, filename=fname)
+            if len(sheets) > 1:
+                multi_sheet_files.append({"filename": fname, "sheet_names": sheets})
+
+        df = read_tabular_file(raw_bytes, filename=fname, read_all_sheets=read_all_sheets)
         rows_cnt = len(df)
         cols_cnt = len(df.columns)
-        norm_cols = {normalize_col_name(c) for c in df.columns}
+        col_lookup: dict[str, str] = {}
+        for c in df.columns:
+            nc = normalize_col_name(c)
+            if nc not in col_lookup:
+                col_lookup[nc] = c
+        norm_cols = set(col_lookup.keys())
+
         role = detect_file_role(norm_cols, cols_cnt)
         total_rows += rows_cnt
         max_cols = max(max_cols, cols_cnt)
         all_norm_cols |= norm_cols
         swap_flags.append((fname, role))
         file_details.append({"filename": fname, "rows": rows_cnt, "cols": cols_cnt, "detected_role": role})
+
+        if {"regn_no", "sem", "course_name"}.issubset(norm_cols) and not df.empty:
+            regn_vals = df[col_lookup["regn_no"]].tolist()
+            sem_vals = df[col_lookup["sem"]].tolist()
+            course_vals = df[col_lookup["course_name"]].tolist()
+            for r_raw, s_raw, c_raw in zip(regn_vals, sem_vals, course_vals):
+                r_norm = norm_text(r_raw, case_insensitive=True)
+                s_norm = norm_sem_key(s_raw)
+                c_norm = norm_course_name(c_raw)
+                if r_norm and s_norm and c_norm:
+                    courses_by_regn_sem.setdefault((r_norm, s_norm), set()).add(c_norm)
+
+    collision_items = [
+        {"regn_no": r, "sem": s, "courses": sorted(cs)}
+        for (r, s), cs in sorted(courses_by_regn_sem.items())
+        if len(cs) >= 2
+    ]
 
     return {
         "file_count": len(file_entries),
@@ -644,12 +817,18 @@ def inspect_uploaded_batch(file_entries: tuple[tuple[str, bytes], ...]) -> dict[
         "has_sem": "sem" in all_norm_cols,
         "file_roles": swap_flags,
         "file_details": file_details,
+        "multi_sheet_files": multi_sheet_files,
+        "course_collision_count": len(collision_items),
+        "course_collision_samples": collision_items[:5],
     }
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
-def _cached_preflight_inspect(file_entries: tuple[tuple[str, bytes], ...]) -> dict[str, Any]:
-    return inspect_uploaded_batch(file_entries)
+def _cached_preflight_inspect(
+    file_entries: tuple[tuple[str, bytes], ...],
+    read_all_sheets: bool = False,
+) -> dict[str, Any]:
+    return inspect_uploaded_batch(file_entries, read_all_sheets=read_all_sheets)
 
 
 # ==============================================================================
@@ -804,6 +983,8 @@ class ReconciliationResult:
     fail_to_pass_raw_sap_df: pd.DataFrame
     pass_corrections_df: pd.DataFrame
     pass_corrections_raw_sap_df: pd.DataFrame
+    abc_only_updates_df: pd.DataFrame
+    abc_only_updates_raw_sap_df: pd.DataFrame
     sap_conflicts_df: pd.DataFrame
     email_conflicts_df: pd.DataFrame
     anomalies_long_df: pd.DataFrame
@@ -812,6 +993,8 @@ class ReconciliationResult:
     column_anomaly_summary_df: pd.DataFrame
     email_only_df: pd.DataFrame
     student_report_df: pd.DataFrame
+    student_pivot_df: pd.DataFrame
+    student_pivot_cell_status: dict[tuple[str, str], str]
     student_timeline_map: dict[str, list[dict[str, str]]]
     semester_columns: list[str]
 
@@ -825,20 +1008,25 @@ def _get_col_series(dataset: LoadedDataset, canonical_col: str) -> pd.Series:
     return pd.Series([""] * len(dataset.df), index=dataset.df.index, dtype=str)
 
 
+def _normalize_key_series(dataset: LoadedDataset, col_name: str) -> pd.Series:
+    """Normalize a matching-key column uniformly across composite keys and deduplication."""
+    col_lower = normalize_col_name(col_name)
+    s = _get_col_series(dataset, col_lower)
+    if col_lower == "sem":
+        return s.map(norm_sem_key)
+    if col_lower == "month":
+        return s.map(lambda v: parse_month(v)[1])
+    if col_lower in ("year", "admission_year"):
+        return s.map(norm_numeric)
+    if col_lower == "dob":
+        return s.map(norm_date)
+    if col_lower == "course_name":
+        return s.map(norm_course_name)
+    return s.map(lambda v: norm_text(v, case_insensitive=True))
+
+
 def _build_composite_key(dataset: LoadedDataset, key_columns: list[str]) -> pd.Series:
-    parts: list[pd.Series] = []
-    for k in key_columns:
-        s = _get_col_series(dataset, k)
-        if k == "sem":
-            parts.append(s.map(norm_sem_key))
-        elif k == "month":
-            parts.append(s.map(lambda v: parse_month(v)[1]))
-        elif k in ("year", "admission_year"):
-            parts.append(s.map(norm_numeric))
-        elif k == "dob":
-            parts.append(s.map(norm_date))
-        else:
-            parts.append(s.map(lambda v: norm_text(v, case_insensitive=True)))
+    parts = [_normalize_key_series(dataset, k) for k in key_columns]
     if len(parts) == 1:
         return parts[0]
     combined = parts[0]
@@ -883,11 +1071,10 @@ def _deduplicate_dataset(
     df["__key__"] = _build_composite_key(dataset, key_columns)
 
     for k in key_columns:
-        s = _get_col_series(dataset, k)
-        df[f"__k_{k}__"] = s.map(norm_sem_key) if k == "sem" else s.map(lambda v: norm_text(v, case_insensitive=True))
+        df[f"__k_{k}__"] = _normalize_key_series(dataset, k)
 
-    regn_s = _get_col_series(dataset, "regn_no").map(lambda v: norm_text(v, case_insensitive=True))
-    sem_s = _get_col_series(dataset, "sem").map(norm_sem_key)
+    regn_s = _normalize_key_series(dataset, "regn_no")
+    sem_s = _normalize_key_series(dataset, "sem")
     cname_s = _get_col_series(dataset, "cname").map(lambda v: norm_text(v, case_insensitive=True))
     result_s = _get_col_series(dataset, "result").map(lambda v: norm_text(v, case_insensitive=True))
     year_raw_s = _get_col_series(dataset, "year")
@@ -956,46 +1143,74 @@ def _deduplicate_dataset(
     dedup_df = df_sorted.drop_duplicates(subset=["__key__"], keep="first").copy()
     dedup_df = dedup_df.sort_values("__orig_order__").reset_index(drop=True)
 
-    dup_rows = df_sorted[df_sorted["__key__"].isin(dup_keys)].copy()
-    mrks_status_col = dataset.col_map.get("mrks_rec_status")
+    dup_rows = df_sorted[df_sorted["__key__"].isin(dup_keys)]
+    mrks_status_col = dataset.col_map.get("mrks_rec_status", "")
+    tot_mrks_col = dataset.col_map.get("tot_mrks", "")
+    sgpa_col = dataset.col_map.get("sgpa", "")
+    n_dup = len(dup_rows)
+
+    grouped_dup_rows: dict[str, list[tuple[Any, ...]]] = {}
+    for item in zip(
+        dup_rows["__key__"].tolist(),
+        dup_rows["__result_norm__"].tolist(),
+        dup_rows["__year_int__"].tolist(),
+        dup_rows["__month_norm__"].tolist(),
+        dup_rows["__mrks_float__"].tolist(),
+        dup_rows["__sgpa_float__"].tolist(),
+        dup_rows["__mrks_status_rank__"].tolist(),
+        dup_rows["__regn_norm__"].tolist(),
+        dup_rows["__sem_norm__"].tolist(),
+        dup_rows["__cname_norm__"].tolist(),
+        dup_rows[tot_mrks_col].tolist() if tot_mrks_col else [""] * n_dup,
+        dup_rows[sgpa_col].tolist() if sgpa_col else [""] * n_dup,
+        dup_rows[mrks_status_col].tolist() if mrks_status_col else [""] * n_dup,
+        dup_rows["__uploaded_file__"].tolist(),
+        dup_rows["__uploaded_row__"].tolist(),
+    ):
+        grouped_dup_rows.setdefault(item[0], []).append(item[1:])
 
     conflict_records: list[dict[str, str]] = []
     conflict_type_by_key: dict[str, str] = {}
 
-    for key_val, grp in dup_rows.groupby("__key__", sort=False):
-        pass_rows = grp[grp["__result_norm__"] == "PASS"]
-        fail_rows = grp[grp["__result_norm__"] == "FAIL"]
+    for key_val, items in grouped_dup_rows.items():
+        pass_count = sum(1 for it in items if it[0] == "PASS")
+        fail_count = sum(1 for it in items if it[0] == "FAIL")
+        has_pass = pass_count > 0
+        has_fail = fail_count > 0
 
-        has_pass = len(pass_rows) > 0
-        has_fail = len(fail_rows) > 0
-
-        sigs = set(
-            zip(
-                grp["__result_norm__"],
-                grp["__year_int__"],
-                grp["__month_norm__"],
-                grp["__mrks_float__"],
-                grp["__sgpa_float__"],
-                grp["__mrks_status_rank__"],
-            )
-        )
+        sigs = {(it[0], it[1], it[2], it[3], it[4], it[5]) for it in items}
         if len(sigs) == 1:
             ctype = "EXACT_OR_NEAR_DUPLICATE"
-        elif has_pass and has_fail and len(pass_rows) == 1:
+        elif has_pass and has_fail and pass_count == 1:
             ctype = "FAIL_AND_PASS"
-        elif has_pass and has_fail and len(pass_rows) > 1:
+        elif has_pass and has_fail and pass_count > 1:
             ctype = "MULTIPLE_PASS_AND_FAIL"
-        elif len(pass_rows) > 1:
-            ym_pairs = set(zip(pass_rows["__year_int__"], pass_rows["__month_norm__"]))
+        elif pass_count > 1:
+            ym_pairs = {(it[1], it[2]) for it in items if it[0] == "PASS"}
             ctype = "MULTIPLE_PASS_DIFF_MONTH_YEAR" if len(ym_pairs) > 1 else "MULTIPLE_PASS_SAME_PERIOD"
-        elif len(fail_rows) > 1:
+        elif fail_count > 1:
             ctype = "MULTIPLE_FAIL"
         else:
             ctype = "DUPLICATE_OTHER"
 
         conflict_type_by_key[key_val] = ctype
 
-        for idx_in_grp, (_, row) in enumerate(grp.iterrows()):
+        for idx_in_grp, (
+            r_norm,
+            yr_int,
+            mo_norm,
+            _mrks_flt,
+            _sgpa_flt,
+            _mstat_rank,
+            regn_val,
+            sem_val,
+            cname_val,
+            tot_raw,
+            sgpa_raw,
+            mstat_raw,
+            ufile,
+            urow,
+        ) in enumerate(items):
             is_winner = idx_in_grp == 0
             if is_winner:
                 if ctype == "EXACT_OR_NEAR_DUPLICATE":
@@ -1009,7 +1224,7 @@ def _deduplicate_dataset(
             else:
                 if ctype == "EXACT_OR_NEAR_DUPLICATE":
                     action = "REMOVED (Duplicate Row)"
-                elif row["__result_norm__"] == "FAIL" and has_pass:
+                elif r_norm == "FAIL" and has_pass:
                     action = "SUPERSEDED (By PASS Record)"
                 elif has_pass:
                     action = "SUPERSEDED (Older/Lower PASS)"
@@ -1019,19 +1234,19 @@ def _deduplicate_dataset(
             conflict_records.append(
                 {
                     "source": source_label,
-                    "regn_no": row["__regn_norm__"],
-                    "sem": row["__sem_norm__"],
-                    "cname": row["__cname_norm__"],
+                    "regn_no": regn_val,
+                    "sem": sem_val,
+                    "cname": cname_val,
                     "conflict_type": ctype,
                     "action": action,
-                    "result": row["__result_norm__"],
-                    "year": str(row["__year_int__"] or ""),
-                    "month": row["__month_norm__"],
-                    "tot_mrks": clean_str(row.get(dataset.col_map.get("tot_mrks", ""), "")),
-                    "sgpa": clean_str(row.get(dataset.col_map.get("sgpa", ""), "")),
-                    "mrks_rec_status": clean_str(row.get(mrks_status_col, "")) if mrks_status_col else "",
-                    "uploaded_file": clean_str(row.get("__uploaded_file__", "")),
-                    "excel_row": clean_str(row.get("__uploaded_row__", "")),
+                    "result": r_norm,
+                    "year": str(yr_int or ""),
+                    "month": mo_norm,
+                    "tot_mrks": clean_str(tot_raw),
+                    "sgpa": clean_str(sgpa_raw),
+                    "mrks_rec_status": clean_str(mstat_raw),
+                    "uploaded_file": clean_str(ufile),
+                    "excel_row": clean_str(urow),
                 }
             )
 
@@ -1076,7 +1291,7 @@ def _build_verified_abc_map(
             if not regn:
                 continue
             status, cleaned_abc = validate_abc_id(a_raw)
-            if status == "VALID":
+            if status in ("VALID", "FIXABLE_FORMAT"):
                 sem_norm = norm_sem_key(s_raw) or "?"
                 src_label = f"{src_name} Sem {sem_norm}"
                 candidates.setdefault(regn, {}).setdefault(cleaned_abc, set()).add(src_label)
@@ -1091,6 +1306,222 @@ def _build_verified_abc_map(
             ambiguous_regns.add(regn)
 
     return verified_map, ambiguous_regns
+
+
+def _short_month_label(month_int: int, month_norm: str = "") -> str:
+    if month_int in SHORT_MONTH_MAP:
+        return SHORT_MONTH_MAP[month_int]
+    if month_norm:
+        return month_norm[:3].upper()
+    return ""
+
+
+def _format_period_short(year_int: int, month_int: int, month_short: str) -> str:
+    if month_short and year_int > 0:
+        return f"{month_short} {year_int}"
+    if month_short:
+        return month_short
+    if year_int > 0:
+        return str(year_int)
+    return ""
+
+
+def _collect_exam_periods(
+    dataset: LoadedDataset,
+) -> dict[tuple[str, str], set[tuple[int, int, str]]]:
+    """Collect distinct (year_int, month_int, month_short) exam attempts per (regn_no, sem)."""
+    periods: dict[tuple[str, str], set[tuple[int, int, str]]] = {}
+    regns = _normalize_key_series(dataset, "regn_no").tolist()
+    sems = _normalize_key_series(dataset, "sem").tolist()
+    yrs = _get_col_series(dataset, "year").tolist()
+    mos = _get_col_series(dataset, "month").tolist()
+
+    for regn, sem, y_raw, m_raw in zip(regns, sems, yrs, mos):
+        if not regn or not sem:
+            continue
+        yr_int = parse_year(y_raw)
+        mo_int, mo_norm = parse_month(m_raw)
+        mo_short = _short_month_label(mo_int, mo_norm)
+        if yr_int > 0 or mo_int > 0 or mo_short:
+            periods.setdefault((regn, sem), set()).add((yr_int, mo_int, mo_short))
+    return periods
+
+
+def _format_attempt_cell(
+    canon_period: tuple[int, int, str],
+    all_periods: set[tuple[int, int, str]],
+    fallback_label: str = "",
+) -> str:
+    """Format canonical attempt first, with distinct earlier attempts newest-to-oldest in brackets."""
+    canon_str = _format_period_short(*canon_period)
+    other_periods = sorted(
+        (p for p in all_periods if p != canon_period and _format_period_short(*p) != ""),
+        key=lambda p: (p[0], p[1], p[2]),
+        reverse=True,
+    )
+    other_strs: list[str] = []
+    seen_labels: set[str] = {canon_str} if canon_str else set()
+    for p in other_periods:
+        lbl = _format_period_short(*p)
+        if lbl and lbl not in seen_labels:
+            seen_labels.add(lbl)
+            other_strs.append(lbl)
+
+    if canon_str and other_strs:
+        return f"{canon_str} ({', '.join(other_strs)})"
+    if canon_str:
+        return canon_str
+    if other_strs:
+        if len(other_strs) == 1:
+            return other_strs[0]
+        return f"{other_strs[0]} ({', '.join(other_strs[1:])})"
+    return fallback_label or "PRESENT"
+
+
+def _ingest_dataset_for_student_map(
+    clean_df: pd.DataFrame,
+    ds: LoadedDataset,
+    by_student_sem_primary: dict[str, dict[str, dict[str, str]]],
+    by_student_sem_records: dict[tuple[str, str], list[dict[str, str]]],
+    student_profile: dict[str, dict[str, str]],
+    sap_conflict_by_key: dict[str, str] | None = None,
+) -> None:
+    """Populate student profile and per-(student, sem) snapshots using columnar zip iteration."""
+    n = len(clean_df)
+    if n == 0:
+        return
+
+    def _col_vals(canon_col: str) -> list[str]:
+        orig = ds.col_map.get(canon_col)
+        if orig and orig in clean_df.columns:
+            return clean_df[orig].tolist()
+        return [""] * n
+
+    keys = clean_df["__key__"].tolist()
+    regns = clean_df["__regn_norm__"].tolist()
+    sems = clean_df["__sem_norm__"].tolist()
+    results = clean_df["__result_norm__"].tolist()
+    yr_ints = clean_df["__year_int__"].tolist()
+    mo_ints = clean_df["__month_int__"].tolist()
+    mo_norms = clean_df["__month_norm__"].tolist()
+
+    cnames = _col_vals("cname")
+    courses = _col_vals("course_name")
+    course_ids = _col_vals("academic_course_id")
+    adm_years = _col_vals("admission_year")
+    abc_ids = _col_vals("abc_account_id")
+    dobs = _col_vals("dob")
+    genders = _col_vals("gender")
+    tot_mrks_vals = _col_vals("tot_mrks")
+    sgpa_vals = _col_vals("sgpa")
+    credit_pts_vals = _col_vals("tot_credit_points")
+    mrks_status_vals = _col_vals("mrks_rec_status")
+
+    conflict_lookup = sap_conflict_by_key or {}
+
+    for (
+        k,
+        regn,
+        sem,
+        res_v,
+        yr_int,
+        mo_int,
+        mo_norm,
+        cname_raw,
+        course_raw,
+        course_id_raw,
+        adm_raw,
+        abc_raw,
+        dob_raw,
+        gender_raw,
+        tot_m_raw,
+        sgpa_raw,
+        cred_raw,
+        mstat_raw,
+    ) in zip(
+        keys,
+        regns,
+        sems,
+        results,
+        yr_ints,
+        mo_ints,
+        mo_norms,
+        cnames,
+        courses,
+        course_ids,
+        adm_years,
+        abc_ids,
+        dobs,
+        genders,
+        tot_mrks_vals,
+        sgpa_vals,
+        credit_pts_vals,
+        mrks_status_vals,
+    ):
+        prof = student_profile.setdefault(
+            regn,
+            {
+                "regn_no": regn,
+                "cname": "",
+                "course_name": "",
+                "academic_course_id": "",
+                "admission_year": "",
+                "abc_account_id": "",
+                "dob": "",
+                "gender": "",
+            },
+        )
+        if not prof["cname"]:
+            v = norm_text(cname_raw, case_insensitive=True)
+            if v:
+                prof["cname"] = v
+        for fld, raw_v in (
+            ("course_name", course_raw),
+            ("academic_course_id", course_id_raw),
+            ("admission_year", adm_raw),
+            ("dob", dob_raw),
+            ("gender", gender_raw),
+        ):
+            if not prof[fld]:
+                v = clean_str(raw_v)
+                if v:
+                    prof[fld] = v
+
+        abc_clean = clean_str(abc_raw)
+        if abc_clean:
+            cur_abc = prof["abc_account_id"]
+            if not cur_abc:
+                prof["abc_account_id"] = abc_clean
+            else:
+                cur_status, _ = validate_abc_id(cur_abc)
+                new_status, new_cleaned = validate_abc_id(abc_clean)
+                if cur_status not in ("VALID", "FIXABLE_FORMAT") and new_status in (
+                    "VALID",
+                    "FIXABLE_FORMAT",
+                ):
+                    prof["abc_account_id"] = new_cleaned
+
+        yr_str = str(yr_int or "")
+        mo_short = _short_month_label(int(mo_int), mo_norm)
+        tot_m = clean_str(tot_m_raw)
+        sgpa_v = clean_str(sgpa_raw)
+
+        snap = {
+            "key": k,
+            "result": res_v,
+            "year_int": str(int(yr_int)),
+            "month_int": str(int(mo_int)),
+            "month_short": mo_short,
+            "period": f"{yr_str} {mo_norm}".strip(),
+            "marks_sgpa": f"{tot_m or '-'} / {sgpa_v or '-'}",
+            "credit_pts": clean_str(cred_raw),
+            "abc_id": abc_clean,
+            "course_id": clean_str(course_id_raw),
+            "mrks_status": clean_str(mstat_raw),
+            "conflict": conflict_lookup.get(k, ""),
+        }
+        by_student_sem_primary.setdefault(regn, {})[sem] = snap
+        by_student_sem_records.setdefault((regn, sem), []).append(snap)
 
 
 def run_reconciliation(
@@ -1121,6 +1552,10 @@ def run_reconciliation(
             c for c in common_cols if c not in DEFAULT_METADATA_COLUMNS and c not in cfg.key_columns
         ]
 
+    # Collect raw exam attempt periods before deduplication discards superseded rows
+    sap_raw_periods = _collect_exam_periods(sap_dataset)
+    email_raw_periods = _collect_exam_periods(email_dataset)
+
     # Step 1: Deduplicate SAP and Email internally
     sap_clean, sap_conflicts_df, sap_conflict_by_key = _deduplicate_dataset(
         sap_dataset, cfg.key_columns, source_label="SAP"
@@ -1146,7 +1581,6 @@ def run_reconciliation(
 
     sap_abc_col = sap_dataset.col_map.get("abc_account_id", "")
     sap_course_col = sap_dataset.col_map.get("course_name", "")
-    sap_adm_col = sap_dataset.col_map.get("admission_year", "")
 
     abc_readiness_list: list[str] = []
     abc_orig_status_list: list[str] = []
@@ -1154,17 +1588,44 @@ def run_reconciliation(
     recovery_source_list: list[str] = []
     abc_audit_rows: list[dict[str, str]] = []
 
-    for _, prow in pending_sap.iterrows():
-        regn = prow["__regn_norm__"]
-        sem = prow["__sem_norm__"]
-        orig_abc = clean_str(prow.get(sap_abc_col, "")) if sap_abc_col else ""
-        abc_status, _ = validate_abc_id(orig_abc)
+    p_regns = pending_sap["__regn_norm__"].tolist()
+    p_sems = pending_sap["__sem_norm__"].tolist()
+    p_cnames = pending_sap["__cname_norm__"].tolist()
+    p_results = pending_sap["__result_norm__"].tolist()
+    p_abcs = pending_sap[sap_abc_col].tolist() if sap_abc_col else [""] * len(pending_sap)
+    p_courses = pending_sap[sap_course_col].tolist() if sap_course_col else [""] * len(pending_sap)
+
+    for regn, sem, cname_val, res_val, orig_abc_raw, course_raw in zip(
+        p_regns, p_sems, p_cnames, p_results, p_abcs, p_courses
+    ):
+        orig_abc = clean_str(orig_abc_raw)
+        course_val = clean_str(course_raw)
+        abc_status, cleaned_abc = validate_abc_id(orig_abc)
         abc_orig_status_list.append(abc_status)
 
         if abc_status == "VALID":
             abc_readiness_list.append("READY")
             recovered_abc_list.append("")
             recovery_source_list.append("")
+        elif abc_status == "FIXABLE_FORMAT":
+            rec_src_str = "Format cleaned (removed spaces/hyphens)"
+            abc_readiness_list.append("RECOVERABLE")
+            recovered_abc_list.append(cleaned_abc)
+            recovery_source_list.append(rec_src_str)
+            abc_audit_rows.append(
+                {
+                    "regn_no": regn,
+                    "sem": sem,
+                    "cname": cname_val,
+                    "course_name": course_val,
+                    "result": res_val,
+                    "original_abc_id": orig_abc,
+                    "issue_type": abc_status,
+                    "ABC_READINESS": "RECOVERABLE",
+                    "recovered_abc_id": cleaned_abc,
+                    "recovery_source": rec_src_str,
+                }
+            )
         elif regn in verified_abc_map:
             rec_id, rec_srcs = verified_abc_map[regn]
             rec_src_str = ", ".join(rec_srcs)
@@ -1175,9 +1636,9 @@ def run_reconciliation(
                 {
                     "regn_no": regn,
                     "sem": sem,
-                    "cname": prow["__cname_norm__"],
-                    "course_name": clean_str(prow.get(sap_course_col, "")) if sap_course_col else "",
-                    "result": prow["__result_norm__"],
+                    "cname": cname_val,
+                    "course_name": course_val,
+                    "result": res_val,
                     "original_abc_id": orig_abc,
                     "issue_type": abc_status,
                     "ABC_READINESS": "RECOVERABLE",
@@ -1199,9 +1660,9 @@ def run_reconciliation(
                 {
                     "regn_no": regn,
                     "sem": sem,
-                    "cname": prow["__cname_norm__"],
-                    "course_name": clean_str(prow.get(sap_course_col, "")) if sap_course_col else "",
-                    "result": prow["__result_norm__"],
+                    "cname": cname_val,
+                    "course_name": course_val,
+                    "result": res_val,
                     "original_abc_id": orig_abc,
                     "issue_type": abc_status,
                     "ABC_READINESS": readiness,
@@ -1247,10 +1708,15 @@ def run_reconciliation(
     )
 
     # Step 4: Enriched Email-Only Records (showing whether student exists in SAP for other sems)
-    sap_sems_by_regn: dict[str, list[str]] = {}
-    for regn, grp in sap_clean.groupby("__regn_norm__", sort=False):
-        sems = sorted({s for s in grp["__sem_norm__"] if s}, key=sem_sort_key)
-        sap_sems_by_regn[regn] = sems
+    sap_sems_sets_by_regn: dict[str, set[str]] = {}
+    for regn, sem_val in zip(
+        sap_clean["__regn_norm__"].tolist(), sap_clean["__sem_norm__"].tolist()
+    ):
+        if sem_val:
+            sap_sems_sets_by_regn.setdefault(regn, set()).add(sem_val)
+    sap_sems_by_regn: dict[str, list[str]] = {
+        regn: sorted(sems, key=sem_sort_key) for regn, sems in sap_sems_sets_by_regn.items()
+    }
 
     email_only_mask = ~email_clean["__key__"].isin(sap_keys_set)
     email_only_raw = email_clean[email_only_mask]
@@ -1286,11 +1752,36 @@ def run_reconciliation(
     email_only_records["excel_row"] = email_only_raw["__uploaded_row__"].tolist()
     email_only_df = pd.DataFrame(email_only_records).reset_index(drop=True)
 
-    # Step 5: Cross-File Matching, FAIL->PASS Upgrades, Anomalies, and PASS->PASS Critical Corrections
+    # Step 5: Cross-File Matching, FAIL->PASS Upgrades, Anomalies, PASS->PASS Critical Corrections & ABC-Only Updates
     matched_sap = sap_clean[sap_clean["__key__"].isin(email_keys_set)].set_index("__key__")
     matched_email = email_clean[email_clean["__key__"].isin(sap_keys_set)].set_index("__key__")
     matched_keys = matched_sap.index.tolist()
     matched_email = matched_email.loc[matched_keys]
+    key_to_pos = {k: i for i, k in enumerate(matched_keys)}
+
+    base_regn = matched_sap["__regn_norm__"].tolist()
+    base_sem = matched_sap["__sem_norm__"].tolist()
+    base_cname = matched_sap["__cname_norm__"].tolist()
+    base_course = matched_sap[sap_course_col].tolist() if sap_course_col else [""] * len(matched_keys)
+    base_sap_res = matched_sap["__result_norm__"].tolist()
+    base_email_res = matched_email["__result_norm__"].tolist()
+    base_sap_yr = matched_sap["__year_int__"].tolist()
+    base_email_yr = matched_email["__year_int__"].tolist()
+    base_sap_mo = matched_sap["__month_norm__"].tolist()
+    base_email_mo = matched_email["__month_norm__"].tolist()
+
+    sap_tot_col = sap_dataset.col_map.get("tot_mrks", "")
+    email_tot_col = email_dataset.col_map.get("tot_mrks", "")
+    sap_sgpa_col = sap_dataset.col_map.get("sgpa", "")
+    email_sgpa_col = email_dataset.col_map.get("sgpa", "")
+    email_mrks_col = email_dataset.col_map.get("mrks_rec_status", "")
+    email_abc_col = email_dataset.col_map.get("abc_account_id", "")
+
+    base_sap_tot = matched_sap[sap_tot_col].tolist() if sap_tot_col else [""] * len(matched_keys)
+    base_email_tot = matched_email[email_tot_col].tolist() if email_tot_col else [""] * len(matched_keys)
+    base_sap_sgpa = matched_sap[sap_sgpa_col].tolist() if sap_sgpa_col else [""] * len(matched_keys)
+    base_email_sgpa = matched_email[email_sgpa_col].tolist() if email_sgpa_col else [""] * len(matched_keys)
+    base_email_mstat = matched_email[email_mrks_col].tolist() if email_mrks_col else [""] * len(matched_keys)
 
     upgrades_mask = (matched_email["__result_norm__"] == "FAIL") & (
         matched_sap["__result_norm__"] == "PASS"
@@ -1299,24 +1790,23 @@ def run_reconciliation(
 
     upgrade_rows: list[dict[str, str]] = []
     for k in upgrade_keys:
-        sr = matched_sap.loc[k]
-        er = matched_email.loc[k]
+        idx = key_to_pos[k]
         upgrade_rows.append(
             {
-                "regn_no": sr["__regn_norm__"],
-                "sem": sr["__sem_norm__"],
-                "cname": sr["__cname_norm__"],
-                "course_name": clean_str(sr.get(sap_course_col, "")) if sap_course_col else "",
-                "email_result": er["__result_norm__"],
-                "email_year": str(er["__year_int__"] or ""),
-                "email_month": er["__month_norm__"],
-                "email_tot_mrks": clean_str(er.get(email_dataset.col_map.get("tot_mrks", ""), "")),
-                "email_sgpa": clean_str(er.get(email_dataset.col_map.get("sgpa", ""), "")),
-                "sap_result": sr["__result_norm__"],
-                "sap_year": str(sr["__year_int__"] or ""),
-                "sap_month": sr["__month_norm__"],
-                "sap_tot_mrks": clean_str(sr.get(sap_dataset.col_map.get("tot_mrks", ""), "")),
-                "sap_sgpa": clean_str(sr.get(sap_dataset.col_map.get("sgpa", ""), "")),
+                "regn_no": base_regn[idx],
+                "sem": base_sem[idx],
+                "cname": base_cname[idx],
+                "course_name": clean_str(base_course[idx]),
+                "email_result": base_email_res[idx],
+                "email_year": str(base_email_yr[idx] or ""),
+                "email_month": base_email_mo[idx],
+                "email_tot_mrks": clean_str(base_email_tot[idx]),
+                "email_sgpa": clean_str(base_email_sgpa[idx]),
+                "sap_result": base_sap_res[idx],
+                "sap_year": str(base_sap_yr[idx] or ""),
+                "sap_month": base_sap_mo[idx],
+                "sap_tot_mrks": clean_str(base_sap_tot[idx]),
+                "sap_sgpa": clean_str(base_sap_sgpa[idx]),
                 "recommended_action": "Upload to DigiLocker with mrks_rec_status = M (Modified)",
             }
         )
@@ -1332,10 +1822,6 @@ def run_reconciliation(
     format_only_records: list[dict[str, str]] = []
     col_summary_records: list[dict[str, Any]] = []
 
-    base_regn = matched_sap["__regn_norm__"].tolist()
-    base_sem = matched_sap["__sem_norm__"].tolist()
-    base_cname = matched_sap["__cname_norm__"].tolist()
-    base_course = matched_sap[sap_course_col].tolist() if sap_course_col else [""] * len(matched_keys)
     src_sap_col = sap_dataset.col_map.get("source_file", "")
     src_email_col = email_dataset.col_map.get("source_file", "")
     base_src_sap = (
@@ -1348,10 +1834,8 @@ def run_reconciliation(
     anomaly_count_by_key: dict[str, int] = {}
     per_key_mismatches: dict[str, list[str]] = {}
     per_key_missing: dict[str, list[str]] = {}
+    per_key_diff_details: dict[str, list[tuple[str, str, str, str]]] = {}
 
-    # Also track PASS -> PASS critical VALUE_MISMATCHes across PASS_CORRECTION_CRITICAL_COLUMNS
-    # regardless of user's anomaly column selection if both columns exist, OR within common_cols!
-    # We evaluate PASS_CORRECTION_CRITICAL_COLUMNS directly on all common PASS->PASS pairs.
     pass_crit_mismatches_by_key: dict[str, list[tuple[str, str, str]]] = {}
 
     for col in compared_cols:
@@ -1417,6 +1901,7 @@ def run_reconciliation(
                         per_key_mismatches.setdefault(k, []).append(col)
                     else:
                         per_key_missing.setdefault(k, []).append(f"{col} ({atype})")
+                    per_key_diff_details.setdefault(k, []).append((col, re_, rs, atype))
                     anomaly_records.append(
                         {
                             "regn_no": base_regn[idx],
@@ -1501,25 +1986,23 @@ def run_reconciliation(
 
     pass_correction_keys = [k for k in matched_keys if k in pass_crit_mismatches_by_key]
     pass_correction_rows: list[dict[str, str]] = []
-    email_mrks_col = email_dataset.col_map.get("mrks_rec_status", "")
     for k in pass_correction_keys:
-        sr = matched_sap.loc[k]
-        er = matched_email.loc[k]
+        idx = key_to_pos[k]
         diffs = pass_crit_mismatches_by_key[k]
         pass_correction_rows.append(
             {
-                "regn_no": sr["__regn_norm__"],
-                "sem": sr["__sem_norm__"],
-                "cname": sr["__cname_norm__"],
-                "course_name": clean_str(sr.get(sap_course_col, "")) if sap_course_col else "",
+                "regn_no": base_regn[idx],
+                "sem": base_sem[idx],
+                "cname": base_cname[idx],
+                "course_name": clean_str(base_course[idx]),
                 "mismatch_columns": ", ".join(c for c, _, _ in diffs),
                 "email_values": " | ".join(f"{c}={ev}" for c, ev, _ in diffs),
                 "sap_values": " | ".join(f"{c}={sv}" for c, _, sv in diffs),
-                "email_tot_mrks": clean_str(er.get(email_dataset.col_map.get("tot_mrks", ""), "")),
-                "sap_tot_mrks": clean_str(sr.get(sap_dataset.col_map.get("tot_mrks", ""), "")),
-                "email_sgpa": clean_str(er.get(email_dataset.col_map.get("sgpa", ""), "")),
-                "sap_sgpa": clean_str(sr.get(sap_dataset.col_map.get("sgpa", ""), "")),
-                "email_mrks_rec_status": clean_str(er.get(email_mrks_col, "")) if email_mrks_col else "",
+                "email_tot_mrks": clean_str(base_email_tot[idx]),
+                "sap_tot_mrks": clean_str(base_sap_tot[idx]),
+                "email_sgpa": clean_str(base_email_sgpa[idx]),
+                "sap_sgpa": clean_str(base_sap_sgpa[idx]),
+                "email_mrks_rec_status": clean_str(base_email_mstat[idx]),
                 "recommended_action": "Upload to DigiLocker with mrks_rec_status = M (Modified)",
             }
         )
@@ -1530,6 +2013,80 @@ def run_reconciliation(
         if pass_correction_keys
         else pd.DataFrame(columns=sap_dataset.original_columns)
     )
+
+    # Detect ABC-Only Updates (Email abc_account_id missing/dummy/invalid while SAP or verified map has valid 12-digit ID)
+    upgrade_keys_set = set(upgrade_keys)
+    pass_corr_keys_set = set(pass_correction_keys)
+    abc_only_keys: list[str] = []
+    abc_only_rows: list[dict[str, str]] = []
+    abc_only_resolved_map: dict[str, str] = {}
+    abc_only_email_status_map: dict[str, str] = {}
+
+    if email_abc_col:
+        matched_email_abcs = matched_email[email_abc_col].tolist()
+        matched_sap_abcs = (
+            matched_sap[sap_abc_col].tolist() if sap_abc_col else [""] * len(matched_keys)
+        )
+        for idx, k in enumerate(matched_keys):
+            if k in upgrade_keys_set or k in pass_corr_keys_set:
+                continue
+            raw_e_abc = clean_str(matched_email_abcs[idx])
+            e_status, _ = validate_abc_id(raw_e_abc)
+            if e_status in ("VALID", "FIXABLE_FORMAT"):
+                continue
+
+            raw_s_abc = clean_str(matched_sap_abcs[idx])
+            s_status, s_cleaned = validate_abc_id(raw_s_abc)
+            regn = base_regn[idx]
+
+            resolved_abc = ""
+            abc_src = ""
+            if s_status == "VALID":
+                resolved_abc = s_cleaned
+                abc_src = "SAP (Same Row)"
+            elif s_status == "FIXABLE_FORMAT":
+                resolved_abc = s_cleaned
+                abc_src = "SAP (Format Cleaned)"
+            elif regn in verified_abc_map:
+                resolved_abc, srcs = verified_abc_map[regn]
+                abc_src = f"Verified ABC Map ({', '.join(srcs)})"
+
+            if not resolved_abc:
+                continue
+
+            abc_only_keys.append(k)
+            abc_only_resolved_map[k] = resolved_abc
+            abc_only_email_status_map[k] = e_status
+            abc_only_rows.append(
+                {
+                    "regn_no": regn,
+                    "sem": base_sem[idx],
+                    "cname": base_cname[idx],
+                    "course_name": clean_str(base_course[idx]),
+                    "sap_result": base_sap_res[idx],
+                    "email_result": base_email_res[idx],
+                    "email_abc_id": raw_e_abc,
+                    "email_abc_status": e_status,
+                    "sap_abc_id": raw_s_abc,
+                    "resolved_abc_id": resolved_abc,
+                    "abc_source": abc_src,
+                    "email_mrks_rec_status": clean_str(base_email_mstat[idx]),
+                    "recommended_action": "Upload to DigiLocker with mrks_rec_status = M (Modified)",
+                }
+            )
+
+    abc_only_updates_df = pd.DataFrame(abc_only_rows)
+    if abc_only_keys:
+        abc_only_updates_raw_sap_df = matched_sap.loc[
+            abc_only_keys, sap_dataset.original_columns
+        ].reset_index(drop=True)
+        if sap_abc_col:
+            abc_only_updates_raw_sap_df[sap_abc_col] = [
+                abc_only_resolved_map[k] for k in abc_only_keys
+            ]
+    else:
+        abc_only_updates_raw_sap_df = pd.DataFrame(columns=sap_dataset.original_columns)
+    abc_only_keys_set = set(abc_only_keys)
 
     anomalies_long_df = pd.DataFrame(anomaly_records)
     format_only_df = pd.DataFrame(format_only_records)
@@ -1573,7 +2130,7 @@ def run_reconciliation(
             )
     anomalies_wide_df = pd.DataFrame(wide_rows)
 
-    # Step 6: Complete Student-Wise Report & Student 360° Timeline Map
+    # Step 6: Complete Student-Wise Report, Student_Pivot_Status & Student 360° Timeline Map
     all_sems = sorted(
         (set(sap_clean["__sem_norm__"]) | set(email_clean["__sem_norm__"])) - {""},
         key=sem_sort_key,
@@ -1582,74 +2139,33 @@ def run_reconciliation(
 
     sap_by_student: dict[str, dict[str, dict[str, str]]] = {}
     email_by_student: dict[str, dict[str, dict[str, str]]] = {}
+    sap_records_by_student_sem: dict[tuple[str, str], list[dict[str, str]]] = {}
+    email_records_by_student_sem: dict[tuple[str, str], list[dict[str, str]]] = {}
     student_profile: dict[str, dict[str, str]] = {}
-
-    def _update_profile(regn: str, row: pd.Series, ds: LoadedDataset) -> None:
-        prof = student_profile.setdefault(
-            regn,
-            {
-                "regn_no": regn,
-                "cname": "",
-                "course_name": "",
-                "academic_course_id": "",
-                "admission_year": "",
-                "abc_account_id": "",
-                "dob": "",
-                "gender": "",
-            },
-        )
-        for field_name in (
-            "cname",
-            "course_name",
-            "academic_course_id",
-            "admission_year",
-            "abc_account_id",
-            "dob",
-            "gender",
-        ):
-            if not prof[field_name]:
-                c = ds.col_map.get(field_name)
-                if c:
-                    val = clean_str(row.get(c, ""))
-                    if val:
-                        prof[field_name] = norm_text(val, case_insensitive=True) if field_name == "cname" else val
 
     pending_readiness_by_key: dict[str, str] = dict(
         zip(pending_sap["__key__"].tolist(), pending_sap["__abc_readiness__"].tolist())
     )
 
-    def _extract_snap(row: pd.Series, ds: LoadedDataset) -> dict[str, str]:
-        tot_m = clean_str(row.get(ds.col_map.get("tot_mrks", ""), ""))
-        sgpa_v = clean_str(row.get(ds.col_map.get("sgpa", ""), ""))
-        yr = str(row["__year_int__"] or "")
-        mo = row["__month_norm__"]
-        return {
-            "key": row["__key__"],
-            "result": row["__result_norm__"],
-            "period": f"{yr} {mo}".strip(),
-            "marks_sgpa": f"{tot_m or '-'} / {sgpa_v or '-'}",
-            "credit_pts": clean_str(row.get(ds.col_map.get("tot_credit_points", ""), "")),
-            "abc_id": clean_str(row.get(ds.col_map.get("abc_account_id", ""), "")),
-            "course_id": clean_str(row.get(ds.col_map.get("academic_course_id", ""), "")),
-            "mrks_status": clean_str(row.get(ds.col_map.get("mrks_rec_status", ""), "")),
-            "conflict": sap_conflict_by_key.get(row["__key__"], ""),
-        }
+    _ingest_dataset_for_student_map(
+        sap_clean,
+        sap_dataset,
+        sap_by_student,
+        sap_records_by_student_sem,
+        student_profile,
+        sap_conflict_by_key=sap_conflict_by_key,
+    )
+    _ingest_dataset_for_student_map(
+        email_clean,
+        email_dataset,
+        email_by_student,
+        email_records_by_student_sem,
+        student_profile,
+    )
 
-    for _, row in sap_clean.iterrows():
-        regn = row["__regn_norm__"]
-        sem = row["__sem_norm__"]
-        _update_profile(regn, row, sap_dataset)
-        sap_by_student.setdefault(regn, {})[sem] = _extract_snap(row, sap_dataset)
-
-    for _, row in email_clean.iterrows():
-        regn = row["__regn_norm__"]
-        sem = row["__sem_norm__"]
-        _update_profile(regn, row, email_dataset)
-        email_by_student.setdefault(regn, {})[sem] = _extract_snap(row, email_dataset)
-
-    upgrade_keys_set = set(upgrade_keys)
-    pass_corr_keys_set = set(pass_correction_keys)
     student_rows: list[dict[str, Any]] = []
+    pivot_rows: list[dict[str, Any]] = []
+    student_pivot_cell_status: dict[tuple[str, str], str] = {}
     student_timeline_map: dict[str, list[dict[str, str]]] = {}
 
     status_counts = {
@@ -1660,7 +2176,7 @@ def run_reconciliation(
         "Email Only": 0,
     }
 
-    for regn in sorted(student_profile.keys()):
+    for regn in sorted(student_profile.keys(), key=_natural_sort_key):
         prof = student_profile[regn]
         s_map = sap_by_student.get(regn, {})
         e_map = email_by_student.get(regn, {})
@@ -1676,13 +2192,26 @@ def run_reconciliation(
         timeline_entries: list[dict[str, str]] = []
 
         sem_cells: dict[str, str] = {}
+        pivot_sem_cells: dict[str, str] = {}
+        pivot_remark_notes: list[str] = []
+
         for s in all_sems:
             col_label = f"Sem {s}"
             in_s = s in s_map
             in_e = s in e_map
             sd = s_map.get(s)
             ed = e_map.get(s)
+            s_recs = sap_records_by_student_sem.get((regn, s), [])
+            e_recs = email_records_by_student_sem.get((regn, s), [])
+            s_keys_for_sem = [r["key"] for r in s_recs]
+            e_keys_for_sem = [r["key"] for r in e_recs]
+            s_keys_set_sem = set(s_keys_for_sem)
+            e_keys_set_sem = set(e_keys_for_sem)
+            matched_sem_keys = [k for k in s_keys_for_sem if k in e_keys_set_sem]
+            pending_sem_recs = [r for r in s_recs if r["key"] not in e_keys_set_sem]
+            email_only_sem_recs = [r for r in e_recs if r["key"] not in s_keys_set_sem]
 
+            # Student_Wise_Report cell status
             if in_s and in_e:
                 assert sd is not None and ed is not None
                 k = sd["key"]
@@ -1693,7 +2222,12 @@ def run_reconciliation(
                     cell_status = "UPGRADE_NEEDED (FAIL->PASS)"
                 elif k in pass_corr_keys_set:
                     has_upgrade_or_corr = True
-                    cell_status = f"M_CORRECTION_NEEDED ({acnt or len(pass_crit_mismatches_by_key.get(k, []))})"
+                    cell_status = (
+                        f"M_CORRECTION_NEEDED ({acnt or len(pass_crit_mismatches_by_key.get(k, []))})"
+                    )
+                elif k in abc_only_keys_set:
+                    has_upgrade_or_corr = True
+                    cell_status = "M_ABC_UPDATE_NEEDED"
                 elif acnt > 0:
                     cell_status = f"UPLOADED_ANOMALY ({acnt})"
                 elif sd["conflict"]:
@@ -1723,6 +2257,106 @@ def run_reconciliation(
                 cell_status = "-"
                 sem_cells[col_label] = "-"
                 mm_cols = ""
+
+            # Student_Pivot_Status cell value, color & remark
+            if not in_s and not in_e:
+                pivot_sem_cells[col_label] = "-"
+                student_pivot_cell_status[(regn, col_label)] = "EMPTY"
+            else:
+                if in_s and sd is not None:
+                    canon_p = (
+                        int(sd["year_int"] or 0),
+                        int(sd["month_int"] or 0),
+                        sd["month_short"],
+                    )
+                    attempt_pool = sap_raw_periods.get((regn, s), set())
+                    fallback_lbl = sd["result"] or "SAP"
+                else:
+                    assert ed is not None
+                    canon_p = (
+                        int(ed["year_int"] or 0),
+                        int(ed["month_int"] or 0),
+                        ed["month_short"],
+                    )
+                    attempt_pool = email_raw_periods.get((regn, s), set())
+                    fallback_lbl = ed["result"] or "EMAIL"
+
+                pivot_sem_cells[col_label] = _format_attempt_cell(
+                    canon_p, attempt_pool, fallback_label=fallback_lbl
+                )
+
+                sem_has_red = False
+                sem_has_yellow = len(pending_sem_recs) > 0
+                sem_has_orange = len(email_only_sem_recs) > 0
+
+                for mk in matched_sem_keys:
+                    mk_acnt = anomaly_count_by_key.get(mk, 0)
+                    is_upg = mk in upgrade_keys_set
+                    is_pcc = mk in pass_corr_keys_set
+                    is_abc_only = mk in abc_only_keys_set
+                    if is_upg or is_pcc or is_abc_only or mk_acnt > 0:
+                        sem_has_red = True
+                        reasons: list[str] = []
+                        if is_upg:
+                            reasons.append("FAIL->PASS upgrade needed")
+                        else:
+                            seen_diff_cols: set[str] = set()
+                            for col_d, ev_d, sv_d in pass_crit_mismatches_by_key.get(mk, []):
+                                if col_d in seen_diff_cols:
+                                    continue
+                                if col_d == "abc_account_id" and is_abc_only:
+                                    continue
+                                seen_diff_cols.add(col_d)
+                                reasons.append(
+                                    f"{col_d}: Email={ev_d or 'BLANK'} vs SAP={sv_d or 'BLANK'}"
+                                )
+                            for col_d, ev_d, sv_d, _ in per_key_diff_details.get(mk, []):
+                                if col_d in seen_diff_cols:
+                                    continue
+                                if col_d == "abc_account_id" and is_abc_only:
+                                    continue
+                                seen_diff_cols.add(col_d)
+                                reasons.append(
+                                    f"{col_d}: Email={ev_d or 'BLANK'} vs SAP={sv_d or 'BLANK'}"
+                                )
+                        if is_abc_only:
+                            e_abc_st = abc_only_email_status_map.get(mk, "MISSING")
+                            if e_abc_st == "MISSING":
+                                reasons.append("ABC ID missing in DigiLocker, valid ID in SAP")
+                            else:
+                                reasons.append(
+                                    "ABC ID invalid/dummy in DigiLocker, valid ID in SAP"
+                                )
+                        if len(reasons) > 5:
+                            reasons_str = "; ".join(reasons[:5]) + f"; (+{len(reasons) - 5} more)"
+                        else:
+                            reasons_str = "; ".join(reasons)
+                        pivot_remark_notes.append(
+                            f"{col_label}: Wrong data in DigiLocker ({reasons_str})"
+                        )
+
+                for pr in pending_sem_recs:
+                    res_tag = pr["result"]
+                    if res_tag:
+                        pivot_remark_notes.append(
+                            f"{col_label}: Pending in SAP (Not uploaded \u2014 {res_tag})"
+                        )
+                    else:
+                        pivot_remark_notes.append(f"{col_label}: Pending in SAP (Not uploaded)")
+
+                if email_only_sem_recs:
+                    pivot_remark_notes.append(
+                        f"{col_label}: Email-only (Present in DigiLocker, missing in SAP)"
+                    )
+
+                if sem_has_red:
+                    student_pivot_cell_status[(regn, col_label)] = "RED"
+                elif sem_has_yellow:
+                    student_pivot_cell_status[(regn, col_label)] = "YELLOW"
+                elif sem_has_orange:
+                    student_pivot_cell_status[(regn, col_label)] = "ORANGE"
+                else:
+                    student_pivot_cell_status[(regn, col_label)] = "GREEN"
 
             if in_s or in_e:
                 timeline_entries.append(
@@ -1788,7 +2422,32 @@ def run_reconciliation(
         row_dict.update(sem_cells)
         student_rows.append(row_dict)
 
+        pivot_row: dict[str, Any] = {
+            "regn_no": prof["regn_no"],
+            "cname": prof["cname"],
+            "course_name": prof["course_name"],
+            "admission_year": prof["admission_year"],
+            "abc_account_id": prof["abc_account_id"],
+        }
+        pivot_row.update(pivot_sem_cells)
+        pivot_row["Remark"] = " | ".join(pivot_remark_notes) if pivot_remark_notes else "All OK"
+        pivot_rows.append(pivot_row)
+
     student_report_df = pd.DataFrame(student_rows)
+    pivot_columns = [
+        "regn_no",
+        "cname",
+        "course_name",
+        "admission_year",
+        "abc_account_id",
+        *semester_columns,
+        "Remark",
+    ]
+    student_pivot_df = (
+        pd.DataFrame(pivot_rows, columns=pivot_columns)
+        if pivot_rows
+        else pd.DataFrame(columns=pivot_columns)
+    )
 
     sap_removed_count = len(sap_dataset.df) - len(sap_clean)
     pending_pass_count = int((pure_pending_sap_df["__pending_result__"] == "PASS").sum())
@@ -1815,6 +2474,7 @@ def run_reconciliation(
         "pending_abc_missing_or_invalid": abc_missing_or_invalid_count,
         "fail_to_pass_upgrades": len(fail_to_pass_upgrades_df),
         "pass_critical_corrections": len(pass_corrections_df),
+        "abc_only_updates": len(abc_only_updates_df),
         "email_only_records": len(email_only_df),
         "email_only_in_sap_other_sems": int((email_only_df["exists_in_sap_other_sems"] == "Yes").sum())
         if not email_only_df.empty
@@ -1843,6 +2503,8 @@ def run_reconciliation(
         fail_to_pass_raw_sap_df=fail_to_pass_raw_sap_df,
         pass_corrections_df=pass_corrections_df,
         pass_corrections_raw_sap_df=pass_corrections_raw_sap_df,
+        abc_only_updates_df=abc_only_updates_df,
+        abc_only_updates_raw_sap_df=abc_only_updates_raw_sap_df,
         sap_conflicts_df=sap_conflicts_df,
         email_conflicts_df=email_conflicts_df,
         anomalies_long_df=anomalies_long_df,
@@ -1851,6 +2513,8 @@ def run_reconciliation(
         column_anomaly_summary_df=column_anomaly_summary_df,
         email_only_df=email_only_df,
         student_report_df=student_report_df,
+        student_pivot_df=student_pivot_df,
+        student_pivot_cell_status=student_pivot_cell_status,
         student_timeline_map=student_timeline_map,
         semester_columns=semester_columns,
         metrics=metrics,
@@ -1867,8 +2531,18 @@ EXPORT_TEXT_ID_COLUMNS: set[str] = PROTECTED_ID_COLUMNS | {
     "abc_id",
     "original_abc_id",
     "recovered_abc_id",
+    "email_abc_id",
+    "sap_abc_id",
+    "resolved_abc_id",
     "email_value",
     "sap_value",
+}
+
+PIVOT_STYLE_MAP: dict[str, tuple[str, str]] = {
+    "GREEN": ("#D1FAE5", "#065F46"),
+    "RED": ("#FEE2E2", "#991B1B"),
+    "YELLOW": ("#FEF3C7", "#92400E"),
+    "ORANGE": ("#FFEDD5", "#9A3412"),
 }
 
 
@@ -1898,6 +2572,60 @@ def build_dynamic_filenames(
     return (f"{pure_base}.csv", f"{pure_base}.xlsx", report_name)
 
 
+def prepare_m_status_sap_export(
+    result: ReconciliationResult,
+    raw_sap_df: pd.DataFrame,
+    *,
+    auto_backfill_abc: bool = True,
+    drop_internal_cols: bool = True,
+    trim_whitespace: bool = True,
+) -> pd.DataFrame:
+    """Prepare raw SAP rows stamped with MRKS_REC_STATUS = 'M' for direct DigiLocker upload."""
+    if raw_sap_df.empty:
+        cols = [
+            c
+            for c in result.sap_original_columns
+            if not drop_internal_cols or normalize_col_name(c) not in INTERNAL_MERGE_COLUMNS
+        ]
+        return pd.DataFrame(columns=cols)
+
+    m_df = raw_sap_df[result.sap_original_columns].copy()
+    sap_mrks_col = result.sap_col_map.get("mrks_rec_status")
+    sap_abc_col = result.sap_col_map.get("abc_account_id")
+    sap_regn_col = result.sap_col_map.get("regn_no")
+
+    if sap_mrks_col:
+        m_df[sap_mrks_col] = "M"
+
+    if auto_backfill_abc and sap_abc_col and not m_df.empty:
+        abc_vals = m_df[sap_abc_col].tolist()
+        regn_vals = m_df[sap_regn_col].tolist() if sap_regn_col else [""] * len(m_df)
+        updated_abcs: list[str] = []
+        for a_raw, r_raw in zip(abc_vals, regn_vals):
+            status, cleaned_abc = validate_abc_id(a_raw)
+            if status == "FIXABLE_FORMAT":
+                updated_abcs.append(cleaned_abc)
+            elif status != "VALID":
+                regn_norm = norm_text(r_raw, case_insensitive=True) if r_raw else ""
+                if regn_norm and regn_norm in result.verified_abc_map:
+                    updated_abcs.append(result.verified_abc_map[regn_norm][0])
+                else:
+                    updated_abcs.append(clean_str(a_raw))
+            else:
+                updated_abcs.append(cleaned_abc)
+        m_df[sap_abc_col] = updated_abcs
+
+    if drop_internal_cols:
+        keep_cols = [c for c in m_df.columns if normalize_col_name(c) not in INTERNAL_MERGE_COLUMNS]
+        m_df = m_df[keep_cols]
+
+    if trim_whitespace and not m_df.empty:
+        for col in m_df.columns:
+            m_df[col] = m_df[col].map(clean_str)
+
+    return m_df.reset_index(drop=True)
+
+
 def filter_pending_sap(
     result: ReconciliationResult,
     result_filter: Literal["ALL", "PASS_ONLY", "FAIL_ONLY"] = "ALL",
@@ -1907,6 +2635,7 @@ def filter_pending_sap(
     auto_backfill_abc: bool = False,
     include_fail_to_pass_upgrades: bool = False,
     include_pass_corrections: bool = False,
+    include_abc_only_updates: bool = False,
     drop_internal_cols: bool = True,
     trim_whitespace: bool = True,
 ) -> pd.DataFrame:
@@ -1933,27 +2662,21 @@ def filter_pending_sap(
     out = df[result.sap_original_columns].copy()
 
     extra_frames: list[pd.DataFrame] = []
-    sap_mrks_col = result.sap_col_map.get("mrks_rec_status")
-    sap_regn_col = result.sap_col_map.get("regn_no")
-
-    def _prepare_m_rows(raw_df: pd.DataFrame) -> pd.DataFrame:
-        m_df = raw_df[result.sap_original_columns].copy()
-        if sap_mrks_col:
-            m_df[sap_mrks_col] = "M"
-        if auto_backfill_abc and sap_abc_col and sap_regn_col and not m_df.empty:
-            for ridx in m_df.index:
-                status, _ = validate_abc_id(m_df.at[ridx, sap_abc_col])
-                if status != "VALID":
-                    regn_norm = norm_text(m_df.at[ridx, sap_regn_col], case_insensitive=True)
-                    if regn_norm in result.verified_abc_map:
-                        m_df.at[ridx, sap_abc_col] = result.verified_abc_map[regn_norm][0]
-        return m_df
-
-    if include_fail_to_pass_upgrades and not result.fail_to_pass_raw_sap_df.empty:
-        extra_frames.append(_prepare_m_rows(result.fail_to_pass_raw_sap_df))
-
-    if include_pass_corrections and not result.pass_corrections_raw_sap_df.empty:
-        extra_frames.append(_prepare_m_rows(result.pass_corrections_raw_sap_df))
+    for enabled, raw_m_df in (
+        (include_fail_to_pass_upgrades, result.fail_to_pass_raw_sap_df),
+        (include_pass_corrections, result.pass_corrections_raw_sap_df),
+        (include_abc_only_updates, result.abc_only_updates_raw_sap_df),
+    ):
+        if enabled and not raw_m_df.empty:
+            extra_frames.append(
+                prepare_m_status_sap_export(
+                    result,
+                    raw_m_df,
+                    auto_backfill_abc=auto_backfill_abc,
+                    drop_internal_cols=False,
+                    trim_whitespace=False,
+                )
+            )
 
     if extra_frames:
         out = pd.concat([out] + extra_frames, ignore_index=True)
@@ -1995,7 +2718,8 @@ def _apply_xlsxwriter_sheet(
         ws.write(0, col_idx, str(col_name), header_fmt)
         sample_vals = safe_df.iloc[:200, col_idx].astype(str).tolist()
         max_len = max([len(str(col_name))] + [len(v) for v in sample_vals], default=10)
-        width = min(max(max_len + 3, 12), max_width)
+        col_cap = 80 if str(col_name) == "Remark" else max_width
+        width = min(max(max_len + 3, 12), col_cap)
         if normalize_col_name(col_name) in EXPORT_TEXT_ID_COLUMNS:
             ws.set_column(col_idx, col_idx, width, text_fmt)
         else:
@@ -2030,7 +2754,170 @@ def _apply_openpyxl_sheet(
                 ws.cell(row=r_i, column=col_idx).number_format = "@"
         sample_vals = safe_df.iloc[:200, col_idx - 1].astype(str).tolist()
         max_len = max([len(str(col_name))] + [len(v) for v in sample_vals], default=10)
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 3, 12), max_width)
+        col_cap = 80 if str(col_name) == "Remark" else max_width
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 3, 12), col_cap)
+
+
+def _write_pivot_sheet_xlsxwriter(
+    writer: pd.ExcelWriter,
+    pivot_df: pd.DataFrame,
+    cell_status: dict[tuple[Any, str], str],
+    sheet_name: str,
+    header_fmt: Any,
+    text_fmt: Any,
+    max_width: int = 42,
+) -> None:
+    """Write Student_Pivot_Status with cell-by-cell pastel colors, frozen Row 1, autofilter & text IDs."""
+    if pivot_df.empty:
+        _apply_xlsxwriter_sheet(writer, pivot_df, sheet_name, header_fmt, text_fmt, max_width=max_width)
+        return
+
+    wb = writer.book
+    ws = wb.add_worksheet(sheet_name)
+    writer.sheets[sheet_name] = ws
+    ws.freeze_panes(1, 0)
+    ws.hide_gridlines(2)
+
+    cols = list(pivot_df.columns)
+    ws.autofilter(0, 0, len(pivot_df), len(cols) - 1)
+
+    status_fmts = {
+        code: wb.add_format({"bg_color": bg, "font_color": fg, "align": "center", "valign": "vcenter"})
+        for code, (bg, fg) in PIVOT_STYLE_MAP.items()
+    }
+    center_fmt = wb.add_format({"align": "center", "valign": "vcenter"})
+
+    identity_or_remark = {
+        "regn_no",
+        "cname",
+        "course_name",
+        "admission_year",
+        "abc_account_id",
+        "Remark",
+    }
+    sem_col_indices = {i: c for i, c in enumerate(cols) if c not in identity_or_remark}
+    id_col_indices = {i for i, c in enumerate(cols) if normalize_col_name(c) in EXPORT_TEXT_ID_COLUMNS}
+    regn_idx = cols.index("regn_no") if "regn_no" in cols else 0
+
+    for col_idx, col_name in enumerate(cols):
+        ws.write(0, col_idx, str(col_name), header_fmt)
+
+    col_lists = [pivot_df[c].tolist() for c in cols]
+    for r_zero, row_vals in enumerate(zip(*col_lists)):
+        r_excel = r_zero + 1
+        regn_val = clean_str(row_vals[regn_idx])
+        for c_idx, raw_val in enumerate(row_vals):
+            sval = clean_str(raw_val)
+            if c_idx in sem_col_indices:
+                scol = sem_col_indices[c_idx]
+                st_code = cell_status.get(
+                    (regn_val, scol), cell_status.get((r_zero, scol), "EMPTY")
+                )
+                fmt = status_fmts.get(st_code)
+                if fmt is not None:
+                    ws.write_string(r_excel, c_idx, sval, fmt)
+                elif sval == "-":
+                    ws.write_string(r_excel, c_idx, sval, center_fmt)
+                else:
+                    ws.write_string(r_excel, c_idx, sval)
+            elif c_idx in id_col_indices:
+                ws.write_string(r_excel, c_idx, sval, text_fmt)
+            else:
+                ws.write_string(r_excel, c_idx, sval)
+
+    for col_idx, col_name in enumerate(cols):
+        sample_vals = pivot_df.iloc[:200, col_idx].astype(str).tolist()
+        max_len = max([len(str(col_name))] + [len(v) for v in sample_vals], default=10)
+        col_cap = 80 if str(col_name) == "Remark" else max_width
+        width = min(max(max_len + 3, 12), col_cap)
+        if col_idx in id_col_indices:
+            ws.set_column(col_idx, col_idx, width, text_fmt)
+        else:
+            ws.set_column(col_idx, col_idx, width)
+
+
+def _write_pivot_sheet_openpyxl(
+    writer: pd.ExcelWriter,
+    pivot_df: pd.DataFrame,
+    cell_status: dict[tuple[Any, str], str],
+    sheet_name: str,
+    max_width: int = 42,
+) -> None:
+    """Write Student_Pivot_Status via openpyxl with cell-by-cell pastel colors and text IDs."""
+    _apply_openpyxl_sheet(writer, pivot_df, sheet_name, max_width=max_width)
+    if pivot_df.empty:
+        return
+
+    ws = writer.sheets[sheet_name]
+    cols = list(pivot_df.columns)
+    identity_or_remark = {
+        "regn_no",
+        "cname",
+        "course_name",
+        "admission_year",
+        "abc_account_id",
+        "Remark",
+    }
+    sem_col_map = {c: i + 1 for i, c in enumerate(cols) if c not in identity_or_remark}
+    regn_vals = pivot_df["regn_no"].tolist() if "regn_no" in cols else [""] * len(pivot_df)
+
+    fills = {
+        code: PatternFill(start_color=bg.lstrip("#"), end_color=bg.lstrip("#"), fill_type="solid")
+        for code, (bg, _) in PIVOT_STYLE_MAP.items()
+    }
+    fonts = {
+        code: Font(color=fg.lstrip("#"))
+        for code, (_, fg) in PIVOT_STYLE_MAP.items()
+    }
+
+    for r_zero, regn_raw in enumerate(regn_vals):
+        r_excel = r_zero + 2
+        regn_val = clean_str(regn_raw)
+        for scol, col_excel in sem_col_map.items():
+            st_code = cell_status.get((regn_val, scol), cell_status.get((r_zero, scol), "EMPTY"))
+            if st_code in fills:
+                cell = ws.cell(row=r_excel, column=col_excel)
+                cell.fill = fills[st_code]
+                cell.font = fonts[st_code]
+
+
+def build_student_pivot_excel(
+    pivot_df: pd.DataFrame,
+    cell_status: dict[tuple[Any, str], str],
+    sheet_name: str = "Student_Pivot_Status",
+) -> bytes:
+    """Export Student_Pivot_Status with pastel cell color coding and text-safe IDs."""
+    safe_name = sheet_name[:31] or "Student_Pivot_Status"
+    buf = io.BytesIO()
+    if HAS_XLSXWRITER:
+        with pd.ExcelWriter(
+            buf,
+            engine="xlsxwriter",
+            engine_kwargs={
+                "options": {
+                    "strings_to_numbers": False,
+                    "strings_to_urls": False,
+                    "strings_to_formulas": False,
+                }
+            },
+        ) as writer:
+            wb = writer.book
+            hdr_fmt = wb.add_format(
+                {
+                    "bold": True,
+                    "bg_color": "#1E3A5F",
+                    "font_color": "#FFFFFF",
+                    "border": 1,
+                    "align": "left",
+                    "valign": "vcenter",
+                }
+            )
+            txt_fmt = wb.add_format({"num_format": "@"})
+            _write_pivot_sheet_xlsxwriter(writer, pivot_df, cell_status, safe_name, hdr_fmt, txt_fmt)
+    else:
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            _write_pivot_sheet_openpyxl(writer, pivot_df, cell_status, safe_name)
+    return buf.getvalue()
 
 
 def build_single_sheet_excel(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
@@ -2077,6 +2964,7 @@ def build_pure_pending_excel(
     auto_backfill_abc: bool = False,
     include_fail_to_pass_upgrades: bool = False,
     include_pass_corrections: bool = False,
+    include_abc_only_updates: bool = False,
     drop_internal_cols: bool = True,
     trim_whitespace: bool = True,
 ) -> bytes:
@@ -2088,6 +2976,7 @@ def build_pure_pending_excel(
         auto_backfill_abc=auto_backfill_abc,
         include_fail_to_pass_upgrades=include_fail_to_pass_upgrades,
         include_pass_corrections=include_pass_corrections,
+        include_abc_only_updates=include_abc_only_updates,
         drop_internal_cols=drop_internal_cols,
         trim_whitespace=trim_whitespace,
     )
@@ -2134,10 +3023,11 @@ def build_reconciliation_report_excel(result: ReconciliationResult) -> bytes:
         {"Category": "DigiLocker Reconciliation", "Metric": "  - Pending PASS Records", "Count": m["pending_pass"]},
         {"Category": "DigiLocker Reconciliation", "Metric": "  - Pending FAIL Records", "Count": m["pending_fail"]},
         {"Category": "ABC Readiness (Pending)", "Metric": "ABC Ready (Valid 12-Digit)", "Count": m["pending_abc_ready"]},
-        {"Category": "ABC Readiness (Pending)", "Metric": "ABC Recoverable (Found in Other Semesters)", "Count": m["pending_abc_recoverable"]},
+        {"Category": "ABC Readiness (Pending)", "Metric": "ABC Recoverable (Found in Other Semesters / Cleaned)", "Count": m["pending_abc_recoverable"]},
         {"Category": "ABC Readiness (Pending)", "Metric": "ABC Missing / Dummy / Invalid (Unrecoverable)", "Count": m["pending_abc_missing_or_invalid"]},
         {"Category": "M-Status Remediation", "Metric": "FAIL -> PASS Upgrades Needed (mrks_rec_status = M)", "Count": m["fail_to_pass_upgrades"]},
         {"Category": "M-Status Remediation", "Metric": "PASS -> PASS Critical Corrections (mrks_rec_status = M)", "Count": m["pass_critical_corrections"]},
+        {"Category": "M-Status Remediation", "Metric": "ABC-Only Updates Needed (mrks_rec_status = M)", "Count": m["abc_only_updates"]},
         {"Category": "Email-Only Audit", "Metric": "Email-Only Records (In Email, Missing in SAP)", "Count": m["email_only_records"]},
         {"Category": "Email-Only Audit", "Metric": "  - Student Exists in SAP for Other Semesters", "Count": m["email_only_in_sap_other_sems"]},
         {"Category": "Cross-File Anomalies", "Metric": "Matched Rows with >= 1 Anomaly", "Count": m["matched_rows_with_anomalies"]},
@@ -2187,6 +3077,7 @@ def build_reconciliation_report_excel(result: ReconciliationResult) -> bytes:
     sheets: list[tuple[str, pd.DataFrame]] = [
         ("Executive_Summary", summary_df),
         ("Student_Wise_Report", result.student_report_df),
+        ("Student_Pivot_Status", result.student_pivot_df),
         ("Pending_Upload_Summary", pending_summary_df),
         ("ABC_Backfill_Audit", result.abc_backfill_audit_df),
         ("SAP_Duplicates_Conflicts", result.sap_conflicts_df),
@@ -2200,6 +3091,7 @@ def build_reconciliation_report_excel(result: ReconciliationResult) -> bytes:
             ("Anomalies_Detailed", result.anomalies_long_df),
             ("Fail_To_Pass_Upgrades", result.fail_to_pass_upgrades_df),
             ("Pass_Critical_Corrections", result.pass_corrections_df),
+            ("ABC_Only_Updates", result.abc_only_updates_df),
             ("Email_Only_Records", result.email_only_df),
         ]
     )
@@ -2232,7 +3124,17 @@ def build_reconciliation_report_excel(result: ReconciliationResult) -> bytes:
             text_fmt = wb.add_format({"num_format": "@"})
 
             for sname, sdf in sheets:
-                _apply_xlsxwriter_sheet(writer, sdf, sname, header_fmt, text_fmt)
+                if sname == "Student_Pivot_Status":
+                    _write_pivot_sheet_xlsxwriter(
+                        writer,
+                        sdf,
+                        result.student_pivot_cell_status,
+                        sname,
+                        header_fmt,
+                        text_fmt,
+                    )
+                else:
+                    _apply_xlsxwriter_sheet(writer, sdf, sname, header_fmt, text_fmt)
 
             _apply_conditional_badges(
                 wb,
@@ -2273,7 +3175,12 @@ def build_reconciliation_report_excel(result: ReconciliationResult) -> bytes:
     else:
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             for sname, sdf in sheets:
-                _apply_openpyxl_sheet(writer, sdf, sname)
+                if sname == "Student_Pivot_Status":
+                    _write_pivot_sheet_openpyxl(
+                        writer, sdf, result.student_pivot_cell_status, sname
+                    )
+                else:
+                    _apply_openpyxl_sheet(writer, sdf, sname)
 
     return buf.getvalue()
 
@@ -2284,10 +3191,23 @@ def build_reconciliation_report_excel(result: ReconciliationResult) -> bytes:
 
 
 def _clear_results() -> None:
-    st.session_state.pop("dl_recon_result", None)
-    st.session_state.pop("dl_recon_run_fingerprint", None)
-    st.session_state.pop("dl_recon_pure_cache", None)
-    st.session_state.pop("dl_recon_report_cache", None)
+    for k in (
+        "dl_recon_result",
+        "dl_recon_run_fingerprint",
+        "dl_recon_pure_cache",
+        "dl_recon_report_cache",
+        "dl_recon_m_cache",
+        "dl_recon_sap_filenames",
+        "dl_recon_email_filenames",
+        "dl_recon_run_timestamp",
+    ):
+        st.session_state.pop(k, None)
+
+
+def _reset_all_session_state() -> None:
+    """Clear all dl_recon_* session state keys for a completely fresh run."""
+    for k in [key for key in list(st.session_state.keys()) if key.startswith("dl_recon_")]:
+        st.session_state.pop(k, None)
 
 
 def _compute_run_fingerprint(
@@ -2304,12 +3224,18 @@ def _compute_run_fingerprint(
     return h.hexdigest()
 
 
-def _render_preflight_box(uploads: list | None, expected_role: Literal["SAP", "EMAIL"]) -> None:
+def _render_preflight_box(
+    uploads: list | None,
+    expected_role: Literal["SAP", "EMAIL"],
+    *,
+    read_all_sheets: bool = False,
+    key_cols: Iterable[str] = ("regn_no", "sem"),
+) -> None:
     if not uploads:
         return
     try:
         entries = tuple((f.name, f.getvalue()) for f in uploads)
-        info = _cached_preflight_inspect(entries)
+        info = _cached_preflight_inspect(entries, read_all_sheets=read_all_sheets)
         key_badges = (
             f"Keys: `regn_no` {'✓' if info['has_regn_no'] else '✗'}, "
             f"`sem` {'✓' if info['has_sem'] else '✗'}"
@@ -2320,6 +3246,33 @@ def _render_preflight_box(uploads: list | None, expected_role: Literal["SAP", "E
         )
         if not info["has_regn_no"] or not info["has_sem"]:
             st.warning("Required default key column(s) (`regn_no` / `sem`) not found in uploaded headers.")
+
+        multi_sheets = info.get("multi_sheet_files", [])
+        if multi_sheets:
+            details = "; ".join(
+                f"`{item['filename']}` ({len(item['sheet_names'])} sheets: {', '.join(item['sheet_names'])})"
+                for item in multi_sheets
+            )
+            if not read_all_sheets:
+                st.warning(
+                    f"Multi-sheet Excel file(s) detected: {details}. Only the first/active sheet is "
+                    "currently being read — enable **Read all sheets in multi-sheet Excel files** "
+                    "under Configuration if data spans multiple sheets."
+                )
+            else:
+                st.info(f"Reading all sheets from multi-sheet Excel file(s): {details}.")
+
+        key_set = set(key_cols)
+        coll_cnt = info.get("course_collision_count", 0)
+        if coll_cnt > 0 and "course_name" not in key_set and "academic_course_id" not in key_set:
+            samples = ", ".join(
+                f"({c['regn_no']}, Sem {c['sem']})" for c in info.get("course_collision_samples", [])
+            )
+            st.warning(
+                f"Cross-program collision detected: **{coll_cnt:,}** `(regn_no, sem)` pair(s) appear "
+                f"under multiple `course_name` values (e.g., {samples}). Consider adding `course_name` "
+                "to **Matching Key Columns** under Configuration."
+            )
 
         wrong_files = [
             fname
@@ -2362,6 +3315,51 @@ def _render_download_bar(df: pd.DataFrame, base_filename: str, key_prefix: str) 
         )
 
 
+def _render_m_status_upload_buttons(
+    res: ReconciliationResult,
+    raw_sap_df: pd.DataFrame,
+    file_slug: str,
+    key_prefix: str,
+) -> None:
+    if raw_sap_df.empty:
+        return
+    sap_names: list[str] = st.session_state.get("dl_recon_sap_filenames", [])
+    prefix = infer_export_prefix(sap_names)
+    date_tag = dt.date.today().strftime("%Y-%m-%d")
+    base_name = f"{prefix}_M_Status_{file_slug}_{date_tag}"
+
+    m_export_df = prepare_m_status_sap_export(res, raw_sap_df, auto_backfill_abc=True)
+    m_cache = st.session_state.setdefault("dl_recon_m_cache", {})
+    if key_prefix not in m_cache:
+        m_cache[key_prefix] = build_single_sheet_excel(m_export_df, sheet_name="Sheet1")
+
+    st.caption(
+        f"Direct NAD / DigiLocker upload export (**{len(m_export_df):,} rows**, "
+        "`MRKS_REC_STATUS = M`, recoverable ABC IDs backfilled):"
+    )
+    c1, c2, _ = st.columns([1.3, 1.4, 3.3])
+    with c1:
+        st.download_button(
+            label="Download M-Status SAP CSV",
+            data=build_pure_pending_csv(m_export_df),
+            file_name=f"{base_name}.csv",
+            mime="text/csv",
+            key=f"{key_prefix}_m_csv_dl",
+            type="primary",
+            use_container_width=True,
+        )
+    with c2:
+        st.download_button(
+            label="Download M-Status SAP Excel",
+            data=m_cache[key_prefix],
+            file_name=f"{base_name}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_m_xlsx_dl",
+            type="primary",
+            use_container_width=True,
+        )
+
+
 def _render_overview_tab(
     res: ReconciliationResult,
     sap_filenames: list[str],
@@ -2396,7 +3394,7 @@ def _render_overview_tab(
     )
 
     st.subheader("2. ABC Readiness & M-Status Remediation")
-    b1, b2, b3, b4 = st.columns(4)
+    b1, b2, b3, b4, b5 = st.columns(5)
     b1.metric("Pending ABC Ready", f"{m['pending_abc_ready']:,}", "Valid 12-digit ID", delta_color="off")
     b2.metric(
         "Pending ABC Recoverable",
@@ -2413,6 +3411,12 @@ def _render_overview_tab(
     b4.metric(
         "PASS Critical Corrections",
         f"{m['pass_critical_corrections']:,}",
+        "Need mrks_rec_status = M",
+        delta_color="off",
+    )
+    b5.metric(
+        "ABC-Only Updates",
+        f"{m.get('abc_only_updates', 0):,}",
         "Need mrks_rec_status = M",
         delta_color="off",
     )
@@ -2491,6 +3495,11 @@ def _render_overview_tab(
                 value=False,
                 key="dl_recon_exp_pass_corr",
             )
+            include_abc_only = st.checkbox(
+                "Include ABC-only updates (stamped MRKS_REC_STATUS = M)",
+                value=False,
+                key="dl_recon_exp_abc_only",
+            )
             drop_internal_cols = st.checkbox(
                 "Drop internal merge columns (SOURCE_FILE, csv_filename)",
                 value=True,
@@ -2509,6 +3518,7 @@ def _render_overview_tab(
                 auto_backfill_abc=auto_backfill,
                 include_fail_to_pass_upgrades=include_upgrades,
                 include_pass_corrections=include_pass_corr,
+                include_abc_only_updates=include_abc_only,
                 drop_internal_cols=drop_internal_cols,
                 trim_whitespace=trim_ws,
             )
@@ -2519,6 +3529,14 @@ def _render_overview_tab(
             st.info(
                 f"**Ready to export:** **{len(export_df):,} rows** × **{len(export_df.columns)} columns**"
             )
+
+            pure_cache_key = (
+                f"{result_filter_code}|{abc_filter_code}|{auto_backfill}|"
+                f"{include_upgrades}|{include_pass_corr}|{include_abc_only}|{drop_internal_cols}|{trim_ws}"
+            )
+            cache_dict = st.session_state.setdefault("dl_recon_pure_cache", {})
+            if pure_cache_key not in cache_dict:
+                cache_dict[pure_cache_key] = build_single_sheet_excel(export_df, sheet_name="Sheet1")
 
             b_csv, b_xlsx = st.columns(2)
             with b_csv:
@@ -2531,41 +3549,16 @@ def _render_overview_tab(
                     type="primary",
                     use_container_width=True,
                 )
-
-            pure_cache_key = (
-                f"{result_filter_code}|{abc_filter_code}|{auto_backfill}|"
-                f"{include_upgrades}|{include_pass_corr}|{drop_internal_cols}|{trim_ws}"
-            )
-            cache_dict = st.session_state.setdefault("dl_recon_pure_cache", {})
             with b_xlsx:
-                if pure_cache_key in cache_dict:
-                    st.download_button(
-                        label="Download Excel (.xlsx)",
-                        data=cache_dict[pure_cache_key],
-                        file_name=pure_xlsx_name,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="dl_recon_dl_pure_xlsx_btn",
-                        type="primary",
-                        use_container_width=True,
-                    )
-                else:
-                    if st.button(
-                        "Prepare Pure SAP Excel",
-                        key="dl_recon_prep_pure_btn",
-                        use_container_width=True,
-                    ):
-                        with st.spinner("Generating text-safe Pure Pending SAP Excel..."):
-                            cache_dict[pure_cache_key] = build_pure_pending_excel(
-                                res,
-                                result_filter=result_filter_code,
-                                abc_filter=abc_filter_code,
-                                auto_backfill_abc=auto_backfill,
-                                include_fail_to_pass_upgrades=include_upgrades,
-                                include_pass_corrections=include_pass_corr,
-                                drop_internal_cols=drop_internal_cols,
-                                trim_whitespace=trim_ws,
-                            )
-                        st.rerun()
+                st.download_button(
+                    label="Download Excel (.xlsx)",
+                    data=cache_dict[pure_cache_key],
+                    file_name=pure_xlsx_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_recon_dl_pure_xlsx_btn",
+                    type="primary",
+                    use_container_width=True,
+                )
 
     with col_dl2:
         with st.container(border=True):
@@ -2574,32 +3567,24 @@ def _render_overview_tab(
             st.info(
                 f"**File:** `{report_xlsx_name}`\n\n"
                 f"Includes sheets for:\n"
-                f"- **Executive Summary** & **Student-Wise Matrix** ({m['total_students']:,} students)\n"
+                f"- **Executive Summary**, **Student-Wise Matrix** & **Student Pivot Status** ({m['total_students']:,} students)\n"
                 f"- **Pending Upload Summary** & **ABC Backfill Audit** ({len(res.abc_backfill_audit_df):,} flagged)\n"
                 f"- **SAP Duplicates/Conflicts** & **Email Duplicates**\n"
                 f"- **Column Stats**, **Anomalies (By Record & Detailed)**, "
-                f"**FAIL→PASS Upgrades**, **PASS Critical Corrections**, & **Email-Only Records**"
+                f"**FAIL→PASS Upgrades**, **PASS Critical Corrections**, **ABC-Only Updates**, & **Email-Only Records**"
             )
-            if "dl_recon_report_cache" in st.session_state:
-                st.download_button(
-                    label=f"Download {report_xlsx_name}",
-                    data=st.session_state["dl_recon_report_cache"],
-                    file_name=report_xlsx_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="dl_recon_dl_rep_btn",
-                    type="primary",
-                    use_container_width=True,
-                )
-            else:
-                if st.button(
-                    "Prepare Full Reconciliation Report",
-                    key="dl_recon_prep_rep_btn",
-                    type="primary",
-                    use_container_width=True,
-                ):
-                    with st.spinner("Building styled multi-sheet Excel report..."):
-                        st.session_state["dl_recon_report_cache"] = build_reconciliation_report_excel(res)
-                    st.rerun()
+            if "dl_recon_report_cache" not in st.session_state:
+                with st.spinner("Building styled multi-sheet Excel report..."):
+                    st.session_state["dl_recon_report_cache"] = build_reconciliation_report_excel(res)
+            st.download_button(
+                label=f"Download {report_xlsx_name}",
+                data=st.session_state["dl_recon_report_cache"],
+                file_name=report_xlsx_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_recon_dl_rep_btn",
+                type="primary",
+                use_container_width=True,
+            )
 
 
 def _render_pending_tab(res: ReconciliationResult) -> None:
@@ -2788,6 +3773,9 @@ def _render_anomalies_tab(res: ReconciliationResult) -> None:
         ):
             st.dataframe(res.fail_to_pass_upgrades_df, use_container_width=True)
             _render_download_bar(res.fail_to_pass_upgrades_df, "Fail_To_Pass_Upgrades", "dl_recon_ftp")
+            _render_m_status_upload_buttons(
+                res, res.fail_to_pass_raw_sap_df, "Fail_To_Pass", "dl_recon_ftp_m"
+            )
 
     if not res.pass_corrections_df.empty:
         with st.expander(
@@ -2797,6 +3785,20 @@ def _render_anomalies_tab(res: ReconciliationResult) -> None:
             st.dataframe(res.pass_corrections_df, use_container_width=True)
             _render_download_bar(
                 res.pass_corrections_df, "Pass_Critical_Corrections", "dl_recon_pcc"
+            )
+            _render_m_status_upload_buttons(
+                res, res.pass_corrections_raw_sap_df, "Pass_Critical_Corrections", "dl_recon_pcc_m"
+            )
+
+    if not res.abc_only_updates_df.empty:
+        with st.expander(
+            f"ABC-Only Updates ({len(res.abc_only_updates_df):,} records — upload with MRKS_REC_STATUS = M)",
+            expanded=False,
+        ):
+            st.dataframe(res.abc_only_updates_df, use_container_width=True)
+            _render_download_bar(res.abc_only_updates_df, "ABC_Only_Updates", "dl_recon_abco")
+            _render_m_status_upload_buttons(
+                res, res.abc_only_updates_raw_sap_df, "ABC_Only_Updates", "dl_recon_abco_m"
             )
 
     col_left, col_right = st.columns([1.15, 1.85])
@@ -2862,6 +3864,25 @@ def _render_anomalies_tab(res: ReconciliationResult) -> None:
     _render_download_bar(view, "Filtered_Anomalies", "dl_recon_tab4")
 
 
+def _style_pivot_preview(df: pd.DataFrame, cell_status: dict[tuple[str, str], str]) -> pd.DataFrame:
+    """Return CSS style matrix matching Student_Pivot_Status pastel color coding."""
+    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+    sem_cols = [
+        c
+        for c in df.columns
+        if c not in {"regn_no", "cname", "course_name", "admission_year", "abc_account_id", "Remark"}
+    ]
+    regns = df["regn_no"].tolist() if "regn_no" in df.columns else [""] * len(df)
+    for row_pos, (idx, regn_raw) in enumerate(zip(df.index, regns)):
+        regn_val = clean_str(regn_raw)
+        for scol in sem_cols:
+            st_code = cell_status.get((regn_val, scol), "EMPTY")
+            if st_code in PIVOT_STYLE_MAP:
+                bg, fg = PIVOT_STYLE_MAP[st_code]
+                styles.at[idx, scol] = f"background-color: {bg}; color: {fg};"
+    return styles
+
+
 def _render_student_report_tab(res: ReconciliationResult) -> None:
     st.subheader("Complete Student-Wise Semester Coverage & 360° Inspector")
     sdf = res.student_report_df
@@ -2869,10 +3890,29 @@ def _render_student_report_tab(res: ReconciliationResult) -> None:
         st.info("No student records found.")
         return
 
+    view_mode = st.radio(
+        "Report View",
+        options=[
+            "Student_Wise_Report (Coverage Status)",
+            "Student_Pivot_Status (Exam Attempts & Pastel Color Matrix)",
+        ],
+        horizontal=True,
+        key="dl_recon_stu_view_mode",
+    )
+
     f1, f2, f3, f4 = st.columns([1.3, 1.5, 1.2, 2])
     with f1:
-        statuses = ["ALL"] + sorted(sdf["Overall_Status"].fillna("").astype(str).unique().tolist())
-        sel_status = st.selectbox("Overall Status", statuses, key="dl_recon_stu_status")
+        if view_mode.startswith("Student_Wise_Report"):
+            statuses = ["ALL"] + sorted(sdf["Overall_Status"].fillna("").astype(str).unique().tolist())
+            sel_status = st.selectbox("Overall Status", statuses, key="dl_recon_stu_status")
+            sel_pivot_remark = "ALL"
+        else:
+            sel_status = "ALL"
+            sel_pivot_remark = st.selectbox(
+                "Remark Filter",
+                ["ALL", "All OK", "Has Discrepancies"],
+                key="dl_recon_pivot_remark_flt",
+            )
     with f2:
         courses = ["ALL"] + sorted([c for c in sdf["course_name"].fillna("").astype(str).unique().tolist() if c])
         sel_course = st.selectbox("Course Name", courses, key="dl_recon_stu_course")
@@ -2884,45 +3924,121 @@ def _render_student_report_tab(res: ReconciliationResult) -> None:
     with f4:
         q = st.text_input("Search Regn No / Student Name / ABC ID", key="dl_recon_stu_search")
 
-    view = sdf.copy()
+    def _apply_common_filters(base_df: pd.DataFrame) -> pd.DataFrame:
+        out = base_df.copy()
+        if sel_course != "ALL":
+            out = out[out["course_name"] == sel_course]
+        if sel_adm != "ALL":
+            out = out[out["admission_year"] == sel_adm]
+        if q.strip():
+            ql = q.strip().lower()
+            out = out[
+                out["regn_no"].fillna("").astype(str).str.lower().str.contains(ql, regex=False, na=False)
+                | out["cname"].fillna("").astype(str).str.lower().str.contains(ql, regex=False, na=False)
+                | out["abc_account_id"].fillna("").astype(str).str.lower().str.contains(ql, regex=False, na=False)
+            ]
+        return out
+
+    view = _apply_common_filters(sdf)
     if sel_status != "ALL":
         view = view[view["Overall_Status"] == sel_status]
-    if sel_course != "ALL":
-        view = view[view["course_name"] == sel_course]
-    if sel_adm != "ALL":
-        view = view[view["admission_year"] == sel_adm]
-    if q.strip():
-        ql = q.strip().lower()
-        view = view[
-            view["regn_no"].fillna("").astype(str).str.lower().str.contains(ql, regex=False, na=False)
-            | view["cname"].fillna("").astype(str).str.lower().str.contains(ql, regex=False, na=False)
-            | view["abc_account_id"].fillna("").astype(str).str.lower().str.contains(ql, regex=False, na=False)
-        ]
 
-    st.caption(f"Showing **{min(len(view), 1000):,}** of **{len(view):,}** students.")
-    st.dataframe(view.head(1000), use_container_width=True, height=450)
-    _render_download_bar(view, "Filtered_Student_Report", "dl_recon_tab5")
+    if view_mode.startswith("Student_Wise_Report"):
+        st.caption(f"Showing **{min(len(view), 1000):,}** of **{len(view):,}** students.")
+        st.dataframe(view.head(1000), use_container_width=True, height=450)
+        _render_download_bar(view, "Filtered_Student_Report", "dl_recon_tab5")
+    else:
+        pivot_view = _apply_common_filters(res.student_pivot_df)
+        if sel_pivot_remark == "All OK":
+            pivot_view = pivot_view[pivot_view["Remark"] == "All OK"]
+        elif sel_pivot_remark == "Has Discrepancies":
+            pivot_view = pivot_view[pivot_view["Remark"] != "All OK"]
 
-    # Single-Student 360° Inspector
+        st.caption(
+            "Color legend: **Green** = Uploaded OK | **Red** = Wrong/Outdated Data in DigiLocker | "
+            "**Yellow** = Pending in SAP | **Orange** = Email-Only | `-` = Not applicable"
+        )
+        preview_limit = 500
+        st.caption(
+            f"Showing **{min(len(pivot_view), preview_limit):,}** of **{len(pivot_view):,}** students "
+            "(full matching dataset is included in CSV / styled Excel downloads below)."
+        )
+        preview_slice = pivot_view.head(preview_limit)
+        if preview_slice.empty:
+            st.dataframe(preview_slice, use_container_width=True, height=450)
+        else:
+            st.dataframe(
+                preview_slice.style.apply(
+                    _style_pivot_preview, cell_status=res.student_pivot_cell_status, axis=None
+                ),
+                use_container_width=True,
+                height=450,
+            )
+
+        if not pivot_view.empty:
+            p1, p2, _ = st.columns([1.2, 1.4, 3.4])
+            with p1:
+                st.download_button(
+                    label="Download Pivot CSV",
+                    data=pivot_view.to_csv(index=False).encode("utf-8"),
+                    file_name="Student_Pivot_Status.csv",
+                    mime="text/csv",
+                    key="dl_recon_pivot_csv_dl",
+                    use_container_width=True,
+                )
+            with p2:
+                st.download_button(
+                    label="Download Styled Pivot Excel",
+                    data=build_student_pivot_excel(pivot_view, res.student_pivot_cell_status),
+                    file_name="Student_Pivot_Status.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_recon_pivot_xlsx_dl",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+    # Single-Student 360° Inspector (searches across ALL rows in res.student_report_df)
     st.markdown("---")
     st.markdown("#### Single-Student 360° Inspector")
-    if view.empty:
-        st.info("No students match the current filter to inspect.")
+    inspector_q = st.text_input(
+        "Search Any Student Across Entire Dataset (Regn No, Name, or ABC ID)",
+        key="dl_recon_360_search",
+        placeholder="Type full or partial Regn No, Student Name, or ABC ID to search all students...",
+    )
+    if inspector_q.strip():
+        iql = inspector_q.strip().lower()
+        inspector_candidates = sdf[
+            sdf["regn_no"].fillna("").astype(str).str.lower().str.contains(iql, regex=False, na=False)
+            | sdf["cname"].fillna("").astype(str).str.lower().str.contains(iql, regex=False, na=False)
+            | sdf["abc_account_id"].fillna("").astype(str).str.lower().str.contains(iql, regex=False, na=False)
+        ]
+        st.caption(
+            f"Found **{len(inspector_candidates):,}** matching student(s) across all **{len(sdf):,}** records."
+        )
+    else:
+        inspector_candidates = view if not view.empty else sdf
+        st.caption(
+            f"Showing up to 500 students from the current table view ({len(inspector_candidates):,} total). "
+            "Use the search box above to jump to any student in the full dataset."
+        )
+
+    if inspector_candidates.empty:
+        st.info("No students match the 360° Inspector search.")
         return
 
-    candidates = view.head(500)
+    candidates = inspector_candidates.head(500)
     options_labels = [
         f"{r} — {n}" if n else str(r)
         for r, n in zip(candidates["regn_no"].tolist(), candidates["cname"].tolist())
     ]
     sel_label = st.selectbox(
-        "Select Student (from current filtered view, up to 500)",
+        "Select Student",
         options=options_labels,
         key="dl_recon_360_select",
     )
     sel_regn = sel_label.split(" — ", 1)[0].strip()
 
-    stu_meta = view[view["regn_no"] == sel_regn].iloc[0]
+    stu_meta = sdf[sdf["regn_no"] == sel_regn].iloc[0]
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Overall Status", str(stu_meta["Overall_Status"]))
     m2.metric("Course", str(stu_meta["course_name"]) or "-")
@@ -2947,6 +4063,67 @@ def _render_student_report_tab(res: ReconciliationResult) -> None:
             st.dataframe(stu_conf, use_container_width=True)
 
 
+def _render_tool_guide() -> None:
+    st.markdown("---")
+    with st.expander("Tool Guide & Help — How to Use This App (Simple Guide)", expanded=False):
+        st.markdown(
+            """
+### What This Tool Does
+This tool compares your college's **SAP Exam Data** against the **DigiLocker Email Reference Data** (the official uploaded records received from NAD/DigiLocker) so you can immediately see:
+- Which student semester records are **still pending upload** (`Pure Pending`),
+- Which uploaded records have **errors, outdated FAIL status, or missing ABC IDs** that need correction (`MRKS_REC_STATUS = M`),
+- Which pending records have **missing ABC IDs that can be auto-filled** from other semesters, and
+- A complete **semester-by-semester status matrix** for every student.
+
+---
+
+### 5-Step Usage Guide
+1. **Upload SAP Raw Data File(s):** Drop one or more `.xlsx` / `.csv` files exported from SAP into Box 1. Check the preflight summary below the box for row counts, sheet alerts, or cross-program warnings.
+2. **Upload Email Reference File(s):** Drop the merged DigiLocker Email reference `.xlsx` / `.csv` file(s) into Box 2.
+3. **Review Configuration (Optional):** Open *Matching Key & Anomaly Configuration* if you have multi-sheet Excel workbooks or students enrolled in multiple programs (`course_name`).
+4. **Click "Run DigiLocker Reconciliation":** Wait a few seconds while duplicates are resolved, ABC IDs are checked, and cross-file comparisons finish.
+5. **Download & Inspect:** Use **Tab 1 (Overview & Exports)** for one-click Pure Pending CSV/Excel and the Full Multi-Sheet Report, **Tab 4** for direct `MRKS_REC_STATUS = M` upload files, and **Tab 5** to inspect individual students or download the color-coded `Student_Pivot_Status` sheet.
+
+---
+
+### Plain-English Glossary
+- **Pure Pending:** Student semester records that exist in SAP Data but are **not yet present** in DigiLocker Email Reference Data. These are ready for fresh upload (`MRKS_REC_STATUS = O` / SAP default).
+- **ABC Readiness (`READY` / `RECOVERABLE` / `MISSING`):**
+  - **READY:** Has a valid 12-digit ABC (APAAR) ID on that row.
+  - **RECOVERABLE:** Missing, dummy (`0` / `0000...`), or hyphen/space-formatted (`0224-0937-4403`) on that row, **but** a valid 12-digit ID was found for the same student in another semester/file or cleaned automatically. Enable *Auto-backfill recoverable ABC IDs* before exporting to fill them in!
+  - **MISSING / INVALID_OR_DUMMY:** No valid 12-digit ABC ID could be found anywhere for that student in the uploaded batch.
+- **`MRKS_REC_STATUS = M` (Modified Upload):** DigiLocker requires `MRKS_REC_STATUS = M` whenever you re-upload a record to replace existing DigiLocker data:
+  - **FAIL → PASS Upgrades:** DigiLocker currently has `FAIL`, but SAP now has `PASS` (e.g., student cleared ATKT/re-exam).
+  - **PASS → PASS Critical Corrections:** Both sides say `PASS`, but marks, SGPA, CGPA, grade, credits, name, DOB, gender, course ID, or ABC ID differ.
+  - **ABC-Only Updates:** DigiLocker is missing a valid 12-digit ABC ID (or has a dummy/invalid ID), while SAP or another semester has the student's valid 12-digit ABC ID.
+- **Email-Only:** Records found in DigiLocker Email Data that do **not** appear in the uploaded SAP files (often older batches or already-graduated semesters not included in the current SAP export).
+- **Automatic Duplicate Resolution Priority:** When the same matching key (e.g., `regn_no + sem`) appears multiple times inside SAP (such as ATKT re-attempts or duplicate exports), the tool automatically keeps one canonical row in this exact priority order:
+  1. **PASS** beats other results, which beat **FAIL**,
+  2. **Latest Exam Year & Month** (e.g., `MAR 2026` beats `DEC 2025`),
+  3. On the same exam period: **`MRKS_REC_STATUS = M`** beats **`O`**, which beats blank,
+  4. Higher total marks → higher SGPA → more populated columns.
+
+---
+
+### `Student_Pivot_Status` Sheet Color Legend
+- 🟩 **Pastel Green (`#D1FAE5`):** Uploaded OK — matched in both SAP and DigiLocker with zero anomalies and no `M`-status updates needed.
+- 🟥 **Pastel Red (`#FEE2E2`):** Wrong / Outdated Data in DigiLocker — needs `MRKS_REC_STATUS = M` (`FAIL→PASS` upgrade, `PASS→PASS` critical correction, `ABC-Only` update) or has a field-level mismatch. Check the **Remark** column for exact details.
+- 🟨 **Pastel Yellow (`#FEF3C7`):** Pending in SAP — available in SAP, not yet uploaded to DigiLocker.
+- 🟧 **Pastel Orange (`#FFEDD5`):** Email-Only — present in DigiLocker Email Data, missing from the uploaded SAP files.
+- **Uncolored (`-`):** No record for that semester in either file.
+- *Note:* When a student has multiple attempts for a semester (e.g., ATKT), the canonical/latest attempt is shown first, with earlier attempts in brackets — e.g. `MAR 2026 (DEC 2025, MAY 2025)`.
+
+---
+
+### Practical Tips
+- **Leading-Zero Safety:** IDs like `regn_no` and `abc_account_id` (e.g., `022409374403`) are read as strict text and exported with Excel's `@` text format (`strings_to_numbers=False`) so Excel never strips leading zeros or converts them to scientific notation (`2.24E+11`).
+- **Multi-Sheet Excel Files:** By default, only the first sheet of an `.xlsx` file is loaded. If your workbook splits semesters or courses across tabs, tick **Read all sheets in multi-sheet Excel files** under Configuration.
+- **UG / PG Same `regn_no` (`course_name` Key):** If the preflight check warns that the same `(regn_no, sem)` appears under multiple courses, add `course_name` to **Matching Key Columns** so UG and PG records don't collide. Parenthesis spacing differences like `B.M.S.(CBCGS)` vs `B.M.S. (CBCGS)` are automatically ignored during matching while preserving your original display text.
+- **Fresh Start:** Click **Reset / Clear Results** next to the Run button anytime to clear all cached files, filters, and outputs before starting a new batch.
+            """
+        )
+
+
 def show() -> None:
     """Entry point rendered inside SVKM ExamAutomationSuite (or standalone main)."""
     st.title("DigiLocker Reconciliation")
@@ -2957,6 +4134,9 @@ def show() -> None:
     )
     st.markdown("---")
 
+    active_read_all_sheets = bool(st.session_state.get("dl_recon_read_all_sheets", False))
+    active_key_cols = st.session_state.get("dl_recon_key_cols", ["regn_no", "sem"])
+
     up_col1, up_col2 = st.columns(2)
     with up_col1:
         with st.container(border=True):
@@ -2966,7 +4146,12 @@ def show() -> None:
                 accept_multiple_files=True,
                 key="dl_recon_sap_uploader",
             )
-            _render_preflight_box(sap_uploads, expected_role="SAP")
+            _render_preflight_box(
+                sap_uploads,
+                expected_role="SAP",
+                read_all_sheets=active_read_all_sheets,
+                key_cols=active_key_cols,
+            )
     with up_col2:
         with st.container(border=True):
             email_uploads = st.file_uploader(
@@ -2975,14 +4160,28 @@ def show() -> None:
                 accept_multiple_files=True,
                 key="dl_recon_email_uploader",
             )
-            _render_preflight_box(email_uploads, expected_role="EMAIL")
+            _render_preflight_box(
+                email_uploads,
+                expected_role="EMAIL",
+                read_all_sheets=active_read_all_sheets,
+                key_cols=active_key_cols,
+            )
 
     with st.expander("Matching Key & Anomaly Configuration", expanded=False):
         cfg_c1, cfg_c2 = st.columns(2)
         with cfg_c1:
             key_cols = st.multiselect(
                 "Matching Key Columns",
-                options=["regn_no", "sem", "academic_course_id", "exam_type", "year", "month", "rroll"],
+                options=[
+                    "regn_no",
+                    "sem",
+                    "course_name",
+                    "academic_course_id",
+                    "exam_type",
+                    "year",
+                    "month",
+                    "rroll",
+                ],
                 default=["regn_no", "sem"],
                 key="dl_recon_key_cols",
             )
@@ -3011,6 +4210,12 @@ def show() -> None:
                     value=", ".join(HIGH_SIGNAL_COLUMNS),
                     key="dl_recon_custom_cols",
                 )
+
+            read_all_sheets_opt = st.checkbox(
+                "Read all sheets in multi-sheet Excel files",
+                value=False,
+                key="dl_recon_read_all_sheets",
+            )
 
         with cfg_c2:
             norm_text_opt = st.checkbox("Normalize whitespace & casing", value=True, key="dl_recon_norm_txt")
@@ -3041,6 +4246,7 @@ def show() -> None:
             scope_mode,
             selected_preset,
             custom_cols_input,
+            read_all_sheets_opt,
             norm_text_opt,
             ignore_punct_opt,
             norm_num_opt,
@@ -3051,96 +4257,125 @@ def show() -> None:
         ),
     )
 
-    run_clicked = st.button(
-        "Run DigiLocker Reconciliation",
-        type="primary",
-        use_container_width=True,
-        key="dl_recon_run_btn",
-    )
+    btn_col1, btn_col2 = st.columns([3.5, 1.0])
+    with btn_col1:
+        run_clicked = st.button(
+            "Run DigiLocker Reconciliation",
+            type="primary",
+            use_container_width=True,
+            key="dl_recon_run_btn",
+        )
+    with btn_col2:
+        reset_clicked = st.button(
+            "Reset / Clear Results",
+            use_container_width=True,
+            key="dl_recon_reset_btn",
+        )
 
+    if reset_clicked:
+        _reset_all_session_state()
+        st.rerun()
+
+    run_failed = False
     if run_clicked:
         if not sap_uploads or not email_uploads:
             st.error("Please upload at least one SAP Data file and one Email Reference Data file.")
-            return
-        if not key_cols:
+            run_failed = True
+        elif not key_cols:
             st.error("Please select at least one matching key column.")
-            return
+            run_failed = True
+        else:
+            _clear_results()
+            try:
+                with st.spinner("Loading Excel/CSV files and running reconciliation..."):
+                    sap_payloads = [(f.name, f.getvalue()) for f in sap_uploads]
+                    email_payloads = [(f.name, f.getvalue()) for f in email_uploads]
+                    sap_ds = load_uploaded_files(sap_payloads, read_all_sheets=read_all_sheets_opt)
+                    email_ds = load_uploaded_files(email_payloads, read_all_sheets=read_all_sheets_opt)
 
-        _clear_results()
-        try:
-            with st.spinner("Loading Excel/CSV files and running reconciliation..."):
-                sap_payloads = [(f.name, f.getvalue()) for f in sap_uploads]
-                email_payloads = [(f.name, f.getvalue()) for f in email_uploads]
-                sap_ds = load_uploaded_files(sap_payloads)
-                email_ds = load_uploaded_files(email_payloads)
+                    if scope_mode == "Preset Group" and selected_preset:
+                        compare_cols: list[str] | None = list(COLUMN_PRESETS[selected_preset])
+                    elif scope_mode == "Custom Columns":
+                        compare_cols = [
+                            c.strip().lower().replace(" ", "_")
+                            for c in custom_cols_input.split(",")
+                            if c.strip()
+                        ]
+                    else:
+                        compare_cols = [
+                            c
+                            for c in sap_ds.col_map
+                            if c in email_ds.col_map and c not in DEFAULT_METADATA_COLUMNS
+                        ]
 
-                if scope_mode == "Preset Group" and selected_preset:
-                    compare_cols: list[str] | None = list(COLUMN_PRESETS[selected_preset])
-                elif scope_mode == "Custom Columns":
-                    compare_cols = [
-                        c.strip().lower().replace(" ", "_")
-                        for c in custom_cols_input.split(",")
-                        if c.strip()
-                    ]
-                else:
-                    compare_cols = [
-                        c
-                        for c in sap_ds.col_map
-                        if c in email_ds.col_map and c not in DEFAULT_METADATA_COLUMNS
-                    ]
+                    cfg = ReconciliationConfig(
+                        key_columns=key_cols,
+                        compare_columns=compare_cols,
+                        normalize_text=norm_text_opt,
+                        normalize_numbers=norm_num_opt,
+                        normalize_months=norm_month_opt,
+                        normalize_dates=norm_date_opt,
+                        ignore_name_punctuation=ignore_punct_opt,
+                        include_one_side_null_anomalies=include_null_gaps,
+                        include_format_only_anomalies=include_fmt_only,
+                    )
+                    result = run_reconciliation(sap_ds, email_ds, config=cfg)
+                    st.session_state["dl_recon_result"] = result
+                    st.session_state["dl_recon_run_fingerprint"] = current_fp
+                    st.session_state["dl_recon_sap_filenames"] = [f.name for f in sap_uploads]
+                    st.session_state["dl_recon_email_filenames"] = [f.name for f in email_uploads]
+                    st.session_state["dl_recon_run_timestamp"] = dt.datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+            except Exception as exc:
+                st.error(f"Reconciliation failed: {exc}")
+                run_failed = True
 
-                cfg = ReconciliationConfig(
-                    key_columns=key_cols,
-                    compare_columns=compare_cols,
-                    normalize_text=norm_text_opt,
-                    normalize_numbers=norm_num_opt,
-                    normalize_months=norm_month_opt,
-                    normalize_dates=norm_date_opt,
-                    ignore_name_punctuation=ignore_punct_opt,
-                    include_one_side_null_anomalies=include_null_gaps,
-                    include_format_only_anomalies=include_fmt_only,
+    if not run_failed:
+        if "dl_recon_result" not in st.session_state:
+            st.info(
+                "Upload both SAP Data and Email Reference Data files above, then click **Run DigiLocker Reconciliation**."
+            )
+        else:
+            if st.session_state.get("dl_recon_run_fingerprint") != current_fp:
+                st.warning(
+                    "Uploaded files or configuration settings have changed since the last run. "
+                    "Click **Run DigiLocker Reconciliation** to refresh results."
                 )
-                result = run_reconciliation(sap_ds, email_ds, config=cfg)
-                st.session_state["dl_recon_result"] = result
-                st.session_state["dl_recon_run_fingerprint"] = current_fp
-                st.session_state["dl_recon_sap_filenames"] = [f.name for f in sap_uploads]
-        except Exception as exc:
-            st.error(f"Reconciliation failed: {exc}")
-            return
 
-    if "dl_recon_result" not in st.session_state:
-        st.info("Upload both SAP Data and Email Reference Data files above, then click **Run DigiLocker Reconciliation**.")
-        return
+            res: ReconciliationResult = st.session_state["dl_recon_result"]
+            sap_names: list[str] = st.session_state.get("dl_recon_sap_filenames", [])
+            email_names: list[str] = st.session_state.get("dl_recon_email_filenames", [])
+            run_ts: str = st.session_state.get("dl_recon_run_timestamp", "")
 
-    if st.session_state.get("dl_recon_run_fingerprint") != current_fp:
-        st.warning(
-            "Uploaded files or configuration settings have changed since the last run. "
-            "Click **Run DigiLocker Reconciliation** to refresh results."
-        )
+            st.caption(
+                f"**Active Batch:** SAP: `{', '.join(sap_names) or '-'}` | "
+                f"Email: `{', '.join(email_names) or '-'}` | "
+                f"Run at: `{run_ts or '-'}`"
+            )
 
-    res: ReconciliationResult = st.session_state["dl_recon_result"]
-    sap_names: list[str] = st.session_state.get("dl_recon_sap_filenames", [])
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(
+                [
+                    "Overview & Exports",
+                    f"Pure Pending Upload ({res.metrics['pending_total']:,})",
+                    f"Duplicates & Conflicts ({len(res.sap_conflicts_df) + len(res.email_conflicts_df):,})",
+                    f"Anomalies & M-Status ({res.metrics['total_field_anomalies']:,})",
+                    f"Student-Wise Report ({res.metrics['total_students']:,})",
+                ]
+            )
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        [
-            "Overview & Exports",
-            f"Pure Pending Upload ({res.metrics['pending_total']:,})",
-            f"Duplicates & Conflicts ({len(res.sap_conflicts_df) + len(res.email_conflicts_df):,})",
-            f"Anomalies & M-Status ({res.metrics['total_field_anomalies']:,})",
-            f"Student-Wise Report ({res.metrics['total_students']:,})",
-        ]
-    )
+            with tab1:
+                _render_overview_tab(res, sap_names)
+            with tab2:
+                _render_pending_tab(res)
+            with tab3:
+                _render_conflicts_tab(res)
+            with tab4:
+                _render_anomalies_tab(res)
+            with tab5:
+                _render_student_report_tab(res)
 
-    with tab1:
-        _render_overview_tab(res, sap_names)
-    with tab2:
-        _render_pending_tab(res)
-    with tab3:
-        _render_conflicts_tab(res)
-    with tab4:
-        _render_anomalies_tab(res)
-    with tab5:
-        _render_student_report_tab(res)
+    _render_tool_guide()
 
 
 if __name__ == "__main__":
